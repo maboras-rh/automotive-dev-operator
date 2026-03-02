@@ -33,7 +33,8 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: CatalogImage is the Schema for the catalogimages API
+        description: CatalogImage represents an automotive OS image in the catalog
+          registry for discovery and deployment
         properties:
           apiVersion:
             description: |-

@@ -1,147 +1,40 @@
-#!/bin/bash
-set -e
+# NOTE: common.sh is prepended to this script at embed time.
 
-validate_arg() {
-  local arg="$1"
-  local name="$2"
-  # Block shell metacharacters that could be used for injection
-  if [[ "$arg" =~ [\;\|\&\$\`\(\)\{\}\<\>\!\\] ]]; then
-    echo "ERROR: Invalid characters in $name: $arg"
-    exit 1
-  fi
-}
-
-validate_custom_def() {
-  local def="$1"
-  # Custom defs should be KEY=VALUE format only
-  if [[ ! "$def" =~ ^[a-zA-Z_][a-zA-Z0-9_]*=.*$ ]]; then
-    echo "ERROR: Invalid custom definition format: $def (expected KEY=VALUE)"
-    exit 1
-  fi
-  validate_arg "$def" "custom definition"
-}
-
+# Initialize optimizations
+echo "DEBUG: Starting build script"
+WORKSPACE_PATH="$(workspaces.shared-workspace.path)"
+echo "DEBUG: WORKSPACE_PATH=$WORKSPACE_PATH"
+detect_stat_command
+echo "DEBUG: Stat command detected"
 
 # Make the internal registry trusted
 # TODO think about whether this is really the right approach
-mkdir -p /etc/containers
-cat > /etc/containers/registries.conf << EOF
-[registries.insecure]
-registries = ['image-registry.openshift-image-registry.svc:5000']
-EOF
-
-if [ -e /dev/fuse ]; then
-  if ! command -v fuse-overlayfs >/dev/null 2>&1; then
-    echo "Installing fuse-overlayfs..."
-    dnf install -y fuse-overlayfs 2>/dev/null || yum install -y fuse-overlayfs 2>/dev/null || true
-  fi
-
-  if command -v fuse-overlayfs >/dev/null 2>&1; then
-    echo "Configuring fuse-overlayfs for container storage..."
-    cat > /etc/containers/storage.conf << EOF
-[storage]
-driver = "overlay"
-runroot = "/run/containers/storage"
-graphroot = "/var/lib/containers/storage"
-
-[storage.options.overlay]
-mount_program = "/usr/bin/fuse-overlayfs"
-EOF
-  else
-    echo "Warning: fuse-overlayfs install failed, using vfs driver"
-    export STORAGE_DRIVER=vfs
-  fi
-else
-  echo "Warning: /dev/fuse not available, using vfs driver"
-  export STORAGE_DRIVER=vfs
-fi
+setup_container_config
+echo "DEBUG: Container config set up"
+setup_var_tmp
+echo "DEBUG: /var/tmp set up"
 
 umask 0077
+echo "DEBUG: umask set"
 
-TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
-REGISTRY="image-registry.openshift-image-registry.svc:5000"
-NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
+setup_cluster_auth
+echo "DEBUG: Cluster auth set up"
+echo "DEBUG: About to read registry credentials"
 
-mkdir -p $HOME/.config
-cat > $HOME/.authjson <<EOF
-{
-  "auths": {
-    "$REGISTRY": {
-      "auth": "$(echo -n "serviceaccount:$TOKEN" | base64 -w0)"
-    }
-  }
-}
-EOF
+# Read registry credentials from workspace and set up auth
+read_registry_creds "/workspace/registry-auth"
+echo "DEBUG: Registry credentials read, setting up auth"
+setup_registry_auth || echo "No custom registry auth found, using cluster auth only"
+echo "DEBUG: Registry auth setup completed"
 
-export REGISTRY_AUTH_FILE=$HOME/.authjson
-export CONTAINERS_REGISTRIES_CONF="/etc/containers/registries.conf"
+# Use REGISTRY_AUTH_FILE for buildah if available
+echo "DEBUG: Setting up buildah registry auth"
+[ -n "$REGISTRY_AUTH_FILE" ] && export BUILDAH_REGISTRY_AUTH_FILE="$REGISTRY_AUTH_FILE"
+echo "DEBUG: Buildah auth set up"
 
-# Read registry credentials from workspace if available
-REGISTRY_AUTH_DIR="/workspace/registry-auth"
-if [ -f "$REGISTRY_AUTH_DIR/REGISTRY_URL" ]; then
-    REGISTRY_URL=$(cat "$REGISTRY_AUTH_DIR/REGISTRY_URL")
-fi
-if [ -f "$REGISTRY_AUTH_DIR/REGISTRY_USERNAME" ]; then
-    REGISTRY_USERNAME=$(cat "$REGISTRY_AUTH_DIR/REGISTRY_USERNAME")
-fi
-if [ -f "$REGISTRY_AUTH_DIR/REGISTRY_PASSWORD" ]; then
-    REGISTRY_PASSWORD=$(cat "$REGISTRY_AUTH_DIR/REGISTRY_PASSWORD")
-fi
-if [ -f "$REGISTRY_AUTH_DIR/REGISTRY_TOKEN" ]; then
-    REGISTRY_TOKEN=$(cat "$REGISTRY_AUTH_DIR/REGISTRY_TOKEN")
-fi
-if [ -f "$REGISTRY_AUTH_DIR/REGISTRY_AUTH_FILE_CONTENT" ]; then
-    REGISTRY_AUTH_FILE_CONTENT=$(cat "$REGISTRY_AUTH_DIR/REGISTRY_AUTH_FILE_CONTENT")
-fi
-
-if [ -n "$REGISTRY_AUTH_FILE_CONTENT" ]; then
-    echo "Using provided registry auth file content"
-    echo "$REGISTRY_AUTH_FILE_CONTENT" > $HOME/.custom_authjson
-    export REGISTRY_AUTH_FILE=$HOME/.custom_authjson
-elif [ -n "$REGISTRY_USERNAME" ] && [ -n "$REGISTRY_PASSWORD" ] && [ -n "$REGISTRY_URL" ]; then
-    echo "Creating registry auth from username/password for $REGISTRY_URL"
-    mkdir -p $HOME/.config
-    AUTH_STRING=$(echo -n "$REGISTRY_USERNAME:$REGISTRY_PASSWORD" | base64 -w0)
-    cat > $HOME/.custom_authjson <<EOF
-{
-  "auths": {
-    "$REGISTRY_URL": {
-      "auth": "$AUTH_STRING"
-    }
-  }
-}
-EOF
-    export REGISTRY_AUTH_FILE=$HOME/.custom_authjson
-elif [ -n "$REGISTRY_TOKEN" ] && [ -n "$REGISTRY_URL" ]; then
-    echo "Creating registry auth from token for $REGISTRY_URL"
-    mkdir -p $HOME/.config
-    cat > $HOME/.custom_authjson <<EOF
-{
-  "auths": {
-    "$REGISTRY_URL": {
-      "auth": "$(echo -n "token:$REGISTRY_TOKEN" | base64 -w0)"
-    },
-    "$REGISTRY": {
-      "auth": "$(echo -n "serviceaccount:$TOKEN" | base64 -w0)"
-    }
-  }
-}
-EOF
-    export REGISTRY_AUTH_FILE=$HOME/.custom_authjson
-fi
-
-if [ -n "$BUILDAH_REGISTRY_AUTH_FILE" ]; then
-    export BUILDAH_REGISTRY_AUTH_FILE="$REGISTRY_AUTH_FILE"
-fi
-
-osbuildPath="/usr/bin/osbuild"
-storePath="/_build"
-runTmp="/run/osbuild/"
-
-mkdir -p "$storePath"
-mkdir -p "$runTmp"
-
+echo "DEBUG: Reading manifest file path"
 MANIFEST_FILE=$(cat /tekton/results/manifest-file-path)
+echo "DEBUG: MANIFEST_FILE=$MANIFEST_FILE"
 if [ -z "$MANIFEST_FILE" ]; then
     echo "Error: No manifest file path provided"
     exit 1
@@ -154,25 +47,14 @@ if [ ! -f "$MANIFEST_FILE" ]; then
     exit 1
 fi
 
-if mountpoint -q "$osbuildPath"; then
+if mountpoint -q "$OSBUILD_PATH"; then
     exit 0
 fi
 
-rootType="system_u:object_r:root_t:s0"
-chcon "$rootType" "$storePath"
+install_custom_ca_certs
+setup_osbuild
 
-installType="system_u:object_r:install_exec_t:s0"
-if ! mountpoint -q "$runTmp"; then
-  mount -t tmpfs tmpfs "$runTmp"
-fi
-
-destPath="$runTmp/osbuild"
-cp -p "$osbuildPath" "$destPath"
-chcon "$installType" "$destPath"
-
-mount --bind "$destPath" "$osbuildPath"
-
-cd $(workspaces.shared-workspace.path)
+cd "$WORKSPACE_PATH"
 
 EXPORT_FORMAT="$(params.export-format)"
 # If format is empty, AIB defaults to raw
@@ -219,29 +101,21 @@ load_args_from_file() {
   while IFS= read -r line || [[ -n "$line" ]]; do
     # Skip empty lines and comments
     [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-    for item in $line; do
-      $validator "$item" "$description"
-      result_array+=("$item")
-    done
+    [ -n "$validator" ] && $validator "$line" "$description"
+    result_array+=("$line")
   done < "$file"
   echo "Loaded ${#result_array[@]} items for $description"
   return 0
 }
 
 # Load custom definitions
-declare -a CUSTOM_DEFS_ARGS=()
-CUSTOM_DEFS_FILE="$(workspaces.manifest-config-workspace.path)/custom-definitions.env"
-if load_args_from_file "$CUSTOM_DEFS_FILE" "custom definitions" validate_custom_def temp_defs; then
-  for def in "${temp_defs[@]}"; do
-    CUSTOM_DEFS_ARGS+=("--define" "$def")
-  done
-fi
+load_custom_definitions "$(workspaces.manifest-config-workspace.path)/custom-definitions.env"
 
 # Load AIB extra arguments
 declare -a AIB_EXTRA_ARGS=()
 AIB_EXTRA_ARGS_FILE="$(workspaces.manifest-config-workspace.path)/aib-extra-args.txt"
 
-if load_args_from_file "$AIB_EXTRA_ARGS_FILE" "AIB extra args" validate_arg AIB_EXTRA_ARGS; then
+if load_args_from_file "$AIB_EXTRA_ARGS_FILE" "AIB extra args" "" AIB_EXTRA_ARGS; then
   :  # Extra args loaded successfully
 else
   echo "No AIB extra args file found"
@@ -257,7 +131,6 @@ case "$arch" in
     ;;
 esac
 
-
 CONTAINER_PUSH="$(params.container-push)"
 BUILD_DISK_IMAGE="$(params.build-disk-image)"
 EXPORT_OCI="$(params.export-oci)"
@@ -272,38 +145,110 @@ echo "BUILD_DISK_IMAGE: $BUILD_DISK_IMAGE"
 echo "EXPORT_OCI: ${EXPORT_OCI:-<empty>}"
 echo "==========================="
 
-if [ -n "$CONTAINER_PUSH" ]; then
-  BOOTC_CONTAINER_NAME="$CONTAINER_PUSH"
-else
-  BOOTC_CONTAINER_NAME="localhost/aib-build:$(params.distro)-$(params.target)"
+REBUILD_BUILDER="$(params.rebuild-builder)"
+
+# Calculate total progress steps based on build options.
+# SYNC: keep in sync with internal/buildapi/progress.go (estimateBuildSteps).
+# Base steps: 1=Preparing, 2=Building, 3=Finalizing
+PROGRESS_TOTAL=3
+STEP_BUILD=2
+STEP_FINALIZE=3
+# Builder preparation steps (bootc/disk without explicit builder + cluster registry available)
+# 2 extra steps: "Preparing builder" (cache check + optional build/push) + "Pulling builder"
+if [ -z "$BUILDER_IMAGE" ] && { [ "$BUILD_MODE" = "bootc" ] || [ "$BUILD_MODE" = "disk" ]; } && [ -n "$CLUSTER_REGISTRY_ROUTE" ]; then
+  PROGRESS_TOTAL=$((PROGRESS_TOTAL + 2))
+  STEP_BUILD=$((STEP_BUILD + 2))
+  STEP_FINALIZE=$((STEP_FINALIZE + 2))
+elif [ -n "$BUILDER_IMAGE" ] && { [ "$BUILD_MODE" = "bootc" ] || [ "$BUILD_MODE" = "disk" ]; }; then
+  PROGRESS_TOTAL=$((PROGRESS_TOTAL + 1))
+  STEP_BUILD=$((STEP_BUILD + 1))
+  STEP_FINALIZE=$((STEP_FINALIZE + 1))
+fi
+if [ -n "$CONTAINER_PUSH" ] && [ "$BUILD_MODE" = "bootc" ]; then
+  PROGRESS_TOTAL=$((PROGRESS_TOTAL + 1))
+  STEP_FINALIZE=$((STEP_FINALIZE + 1))
+fi
+# Compression step (for disk image builds)
+if [ "$BUILD_DISK_IMAGE" = "true" ] || [ "$BUILD_MODE" = "image" ] || [ "$BUILD_MODE" = "package" ] || [ "$BUILD_MODE" = "disk" ]; then
+  PROGRESS_TOTAL=$((PROGRESS_TOTAL + 1))
+  STEP_FINALIZE=$((STEP_FINALIZE + 1))
 fi
 
-BUILD_CONTAINER_ARG=""
-LOCAL_BUILDER_IMAGE="localhost/aib-build:$(params.distro)-$TARGET_ARCH"
+emit_progress "Preparing build" 1 "$PROGRESS_TOTAL"
+
+# Use parameter expansion for cleaner default value assignment
+BOOTC_CONTAINER_NAME="${CONTAINER_PUSH:-localhost/aib-build:$(params.distro)-$(params.target)}"
+
+# Calculate AIB hash for consistent naming with build_builder.sh
+AIB_HASH=$(echo -n "$(params.automotive-image-builder)" | sha256sum | cut -c1-8)
+# Local builder image name (matches what build_builder.sh creates with --out)
+LOCAL_BUILDER_IMAGE="localhost/aib-build:$(params.distro)-${TARGET_ARCH}-${AIB_HASH}"
 
 # For bootc/disk builds, if no builder-image is provided but cluster-registry-route is set,
-# use the image that prepare-builder cached in the cluster registry
+# prepare the builder image inline (previously done by separate prepare-builder task)
 if [ -z "$BUILDER_IMAGE" ] && { [ "$BUILD_MODE" = "bootc" ] || [ "$BUILD_MODE" = "disk" ]; } && [ -n "$CLUSTER_REGISTRY_ROUTE" ]; then
-  NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
-  BUILDER_IMAGE="${CLUSTER_REGISTRY_ROUTE}/${NAMESPACE}/aib-build:$(params.distro)-$TARGET_ARCH"
-  echo "Using builder image from cluster registry: $BUILDER_IMAGE"
+  TARGET_BUILDER_IMAGE="${CLUSTER_REGISTRY_ROUTE}/${NAMESPACE}/aib-build:$(params.distro)-${TARGET_ARCH}-${AIB_HASH}"
+
+  # Add auth entry for the external registry route hostname.
+  # setup_cluster_auth only created an entry for the internal registry;
+  # skopeo needs credentials for the route hostname too.
+  ROUTE_HOST=$(echo "$CLUSTER_REGISTRY_ROUTE" | cut -d'/' -f1)
+  TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null || echo "")
+  if [ -n "$TOKEN" ] && [ -n "$REGISTRY_AUTH_FILE" ]; then
+    ROUTE_AUTH=$(echo -n "serviceaccount:$TOKEN" | base64 -w0)
+    python3 -c "
+import json, sys
+f = sys.argv[1]
+with open(f) as fh: d = json.load(fh)
+d['auths'][sys.argv[2]] = {'auth': sys.argv[3]}
+with open(f, 'w') as fh: json.dump(d, fh)
+" "$REGISTRY_AUTH_FILE" "$ROUTE_HOST" "$ROUTE_AUTH"
+    echo "Added auth entry for registry route: $ROUTE_HOST"
+  fi
+
+  emit_progress "Preparing builder" 2 "$PROGRESS_TOTAL"
+
+  BUILDER_CACHED=false
+  if [ "$REBUILD_BUILDER" = "true" ]; then
+    echo "Rebuild requested, skipping cache check"
+  else
+    echo "Checking if $TARGET_BUILDER_IMAGE exists in cluster registry..."
+    if skopeo inspect --authfile="$REGISTRY_AUTH_FILE" "docker://$TARGET_BUILDER_IMAGE" >/dev/null 2>&1; then
+      echo "Builder image found in cluster registry: $TARGET_BUILDER_IMAGE"
+      BUILDER_CACHED=true
+    fi
+  fi
+
+  if [ "$BUILDER_CACHED" = "false" ]; then
+    echo "Builder image not found, building..."
+    echo "Running: aib build-builder --distro $(params.distro) --build-dir /_build --cache /_build/dnf-cache ${CUSTOM_DEFS_ARGS[*]} $LOCAL_BUILDER_IMAGE"
+    aib --verbose build-builder --build-dir /_build --cache /_build/dnf-cache --distro "$(params.distro)" "${CUSTOM_DEFS_ARGS[@]}" "$LOCAL_BUILDER_IMAGE"
+
+    echo "Built local image: $LOCAL_BUILDER_IMAGE"
+    echo "Pushing to cluster registry: $TARGET_BUILDER_IMAGE"
+    skopeo copy --authfile="$REGISTRY_AUTH_FILE" \
+      "containers-storage:$LOCAL_BUILDER_IMAGE" \
+      "docker://$TARGET_BUILDER_IMAGE"
+    echo "Builder image pushed: $TARGET_BUILDER_IMAGE"
+  fi
+
+  BUILDER_IMAGE="$TARGET_BUILDER_IMAGE"
+  echo "Using builder image: $BUILDER_IMAGE"
 fi
 
+# Record the effective builder image used for annotation
+echo -n "${BUILDER_IMAGE:-}" > /tekton/results/builder-image
+
+# Set up builder image if needed (consolidated logic)
+declare -a BUILD_CONTAINER_ARGS=()
 if [ -n "$BUILDER_IMAGE" ] && { [ "$BUILD_MODE" = "bootc" ] || [ "$BUILD_MODE" = "disk" ]; }; then
+  emit_progress "Pulling builder image" $((STEP_BUILD - 1)) "$PROGRESS_TOTAL"
   echo "Pulling builder image to local storage: $BUILDER_IMAGE"
 
   TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null || echo "")
   if [ -n "$TOKEN" ]; then
     REGISTRY_HOST=$(echo "$BUILDER_IMAGE" | cut -d'/' -f1)
-    cat > /tmp/builder-auth.json <<EOF
-{
-  "auths": {
-    "$REGISTRY_HOST": {
-      "auth": "$(echo -n "serviceaccount:$TOKEN" | base64 -w0)"
-    }
-  }
-}
-EOF
+    create_service_account_auth "$REGISTRY_HOST" /tmp/builder-auth.json
     skopeo copy --authfile=/tmp/builder-auth.json \
       "docker://$BUILDER_IMAGE" \
       "containers-storage:$LOCAL_BUILDER_IMAGE"
@@ -314,13 +259,6 @@ EOF
   fi
 
   echo "Builder image ready in local storage: $LOCAL_BUILDER_IMAGE"
-  BUILD_CONTAINER_ARG="--build-container $LOCAL_BUILDER_IMAGE"
-fi
-
-# Build command execution using arrays for security (no eval)
-# Parse BUILD_CONTAINER_ARG safely
-declare -a BUILD_CONTAINER_ARGS=()
-if [ -n "$LOCAL_BUILDER_IMAGE" ]; then
   BUILD_CONTAINER_ARGS=("--build-container" "$LOCAL_BUILDER_IMAGE")
 fi
 
@@ -335,8 +273,9 @@ fi
 
 # Common build arguments used across all modes
 declare -a COMMON_BUILD_ARGS=(
-  --build-dir=/output/_build
-  --osbuild-manifest=/output/image.json
+  --build-dir=/_build
+  --cache=/_build/dnf-cache
+  --osbuild-manifest=/_build/image.json
 )
 
 case "$BUILD_MODE" in
@@ -349,6 +288,7 @@ case "$BUILD_MODE" in
       fi
 
       echo "Running bootc build"
+      emit_progress "Building image" "$STEP_BUILD" "$PROGRESS_TOTAL"
       aib --verbose build \
         --distro "$(params.distro)" \
         --target "$(params.target)" \
@@ -363,11 +303,61 @@ case "$BUILD_MODE" in
         "${DISK_OUTPUT_ARGS[@]}"
 
       if [ -n "$CONTAINER_PUSH" ]; then
+        emit_progress "Pushing container" "$((STEP_BUILD + 1))" "$PROGRESS_TOTAL"
+        PUSH_SRC="containers-storage:$BOOTC_CONTAINER_NAME"
+
+        if [ -z "$BUILDER_IMAGE" ]; then
+          echo "Error: BUILDER_IMAGE is empty; cannot annotate bootc container"
+          exit 1
+        fi
+
+        # Add builder-image as manifest annotation + config label.
+        echo "Annotating bootc container with builder image: $BUILDER_IMAGE"
+        OCI_DIR="/tmp/bootc-oci"
+        rm -rf "$OCI_DIR"
+        skopeo copy "$PUSH_SRC" "oci:${OCI_DIR}:latest"
+
+        # Use inline Python for OCI annotation (extracted from original embedded code)
+        python3 - "$OCI_DIR" "$BUILDER_IMAGE" <<'PYEOF'
+import json, sys, hashlib, os
+from pathlib import Path
+
+def update_blob(oci_dir, old_digest, data):
+    content = json.dumps(data, indent=2).encode()
+    new_digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
+    blob_path = Path(oci_dir) / "blobs" / "sha256"
+    old_path = blob_path / old_digest.split(":", 1)[1]
+    new_path = blob_path / new_digest.split(":", 1)[1]
+    new_path.write_bytes(content)
+    if old_path != new_path:
+        old_path.unlink()
+    return new_digest, len(content)
+
+oci_dir, builder_image = sys.argv[1], sys.argv[2]
+key = "automotive.sdv.cloud.redhat.com/builder-image"
+
+index_path = Path(oci_dir) / "index.json"
+index = json.loads(index_path.read_text())
+manifest_entry = index["manifests"][0]
+
+manifest_path = Path(oci_dir) / "blobs" / manifest_entry["digest"].replace(":", "/")
+manifest = json.loads(manifest_path.read_text())
+
+config_path = Path(oci_dir) / "blobs" / manifest["config"]["digest"].replace(":", "/")
+config = json.loads(config_path.read_text())
+
+config.setdefault("config", {}).setdefault("Labels", {})[key] = builder_image
+manifest["config"]["digest"], manifest["config"]["size"] = update_blob(oci_dir, manifest["config"]["digest"], config)
+manifest.setdefault("annotations", {})[key] = builder_image
+manifest_entry["digest"], manifest_entry["size"] = update_blob(oci_dir, manifest_entry["digest"], manifest)
+
+index_path.write_text(json.dumps(index, indent=2))
+PYEOF
+        PUSH_SRC="oci:${OCI_DIR}:latest"
+
         echo "Pushing container to registry: $CONTAINER_PUSH"
-        skopeo copy \
-          --authfile="$REGISTRY_AUTH_FILE" \
-          "containers-storage:$BOOTC_CONTAINER_NAME" \
-          "docker://$CONTAINER_PUSH"
+        skopeo copy --authfile="$REGISTRY_AUTH_FILE" "$PUSH_SRC" "docker://$CONTAINER_PUSH"
+        rm -rf "${OCI_DIR:-/tmp/nonexistent}" 2>/dev/null || true
         echo "Container pushed successfully to $CONTAINER_PUSH"
       fi
 
@@ -378,6 +368,7 @@ case "$BUILD_MODE" in
       ;;
     image|package)
       echo "Running $BUILD_MODE build"
+      emit_progress "Building image" "$STEP_BUILD" "$PROGRESS_TOTAL"
       aib-dev --verbose build \
         "${CUSTOM_DEFS_ARGS[@]}" \
         --distro "$(params.distro)" \
@@ -395,8 +386,7 @@ case "$BUILD_MODE" in
         echo "Error: container-ref is required for disk mode"
         exit 1
       fi
-      # Validate container reference for shell injection
-      validate_arg "$CONTAINER_REF" "container-ref"
+      validate_container_ref "$CONTAINER_REF"
       echo "Creating disk image from container: $CONTAINER_REF"
 
       # Pull the container image first
@@ -410,6 +400,7 @@ case "$BUILD_MODE" in
       fi
 
       echo "Running to-disk-image"
+      emit_progress "Building image" "$STEP_BUILD" "$PROGRESS_TOTAL"
       aib --verbose to-disk-image \
         "${FORMAT_ARGS[@]}" \
         "${BUILD_CONTAINER_ARGS[@]}" \
@@ -429,7 +420,7 @@ echo "Build completed. Contents of output directory:"
 ls -la /output/ || true
 
 pushd /output
-mkdir -p $(workspaces.shared-workspace.path)
+mkdir -p "$WORKSPACE_PATH"
 
 # Check if disk image was created (only exists when BUILD_DISK_IMAGE=true or non-bootc mode)
 DISK_IMAGE_EXISTS=false
@@ -441,13 +432,13 @@ if [ -e "/output/${exportFile}" ]; then
 
     if [ -d "/output/${exportFile}" ]; then
         echo "${exportFile} is a directory, copying recursively..."
-        cp -rv "/output/${exportFile}" $(workspaces.shared-workspace.path)/ || echo "Failed to copy ${exportFile}"
+        cp -rv "/output/${exportFile}" "$WORKSPACE_PATH/" || echo "Failed to copy ${exportFile}"
     else
         echo "${exportFile} is a regular file, copying..."
-        cp -v "/output/${exportFile}" $(workspaces.shared-workspace.path)/ || echo "Failed to copy ${exportFile}"
+        cp -v "/output/${exportFile}" "$WORKSPACE_PATH/" || echo "Failed to copy ${exportFile}"
     fi
 
-    pushd $(workspaces.shared-workspace.path)
+    pushd "$WORKSPACE_PATH"
     if [ -d "${exportFile}" ]; then
         echo "Creating symlink to directory ${exportFile}"
         ln -sf ${exportFile} disk.img
@@ -460,13 +451,17 @@ else
     echo "No disk image created (container-only build)"
 fi
 
-cp -v /output/image.json $(workspaces.shared-workspace.path)/image.json || echo "Failed to copy image.json"
+cp -v /_build/image.json "$WORKSPACE_PATH/image.json" || echo "Failed to copy image.json"
 
 echo "Contents of shared workspace:"
-ls -la $(workspaces.shared-workspace.path)/
+ls -la "$WORKSPACE_PATH/"
 
 COMPRESSION="$(params.compression)"
+if [ "$BUILD_DISK_IMAGE" = "true" ] || [ "$BUILD_MODE" = "image" ] || [ "$BUILD_MODE" = "package" ] || [ "$BUILD_MODE" = "disk" ]; then
+  emit_progress "Compressing artifacts" "$((STEP_FINALIZE - 1))" "$PROGRESS_TOTAL"
+fi
 echo "Requested compression: $COMPRESSION"
+GZIP_COMPRESSOR="gzip"
 
 ensure_lz4() {
   if ! command -v lz4 >/dev/null 2>&1; then
@@ -487,43 +482,35 @@ ensure_lz4() {
   fi
 }
 
+setup_gzip_compressor() {
+  if command -v pigz >/dev/null 2>&1; then
+    GZIP_COMPRESSOR="pigz"
+    echo "Using pigz for gzip compression"
+  else
+    echo "pigz not found; using gzip for compression"
+  fi
+}
+
 if [ "$COMPRESSION" = "lz4" ]; then
   ensure_lz4
+elif [ "$COMPRESSION" = "gzip" ]; then
+  setup_gzip_compressor
 fi
 
-compress_file_gzip() {
-  src="$1"; dest="$2"
-  gzip -c "$src" > "$dest"
-}
-
-compress_file_lz4() {
-  src="$1"; dest="$2"
-  lz4 -z -f -q "$src" "$dest"
-}
-
-tar_dir_gzip() {
-  dir="$1"; out="$2"
-  tar -C $(workspaces.shared-workspace.path) -czf "$out" "$dir"
-}
-
-tar_dir_lz4() {
-  dir="$1"; out="$2"
-  tar -C $(workspaces.shared-workspace.path) -cf - "$dir" | lz4 -z -f -q > "$out"
-}
-
+# Simplified compression functions - no unnecessary dispatching
 compress_file() {
-  src="$1"; dest="$2"
+  local src="$1" dest="$2"
   case "$COMPRESSION" in
-    lz4) compress_file_lz4 "$src" "$dest" ;;
-    gzip|*) compress_file_gzip "$src" "$dest" ;;
+    lz4) lz4 -z -f -q "$src" "$dest" ;;
+    gzip|*) "$GZIP_COMPRESSOR" -c "$src" > "$dest" ;;
   esac
 }
 
 tar_dir() {
-  dir="$1"; out="$2"
+  local dir="$1" out="$2"
   case "$COMPRESSION" in
-    lz4) tar_dir_lz4 "$dir" "$out" ;;
-    gzip|*) tar_dir_gzip "$dir" "$out" ;;
+    lz4) tar -C "$WORKSPACE_PATH" -cf - "$dir" | lz4 -z -f -q > "$out" ;;
+    gzip|*) tar -C "$WORKSPACE_PATH" -cf - "$dir" | "$GZIP_COMPRESSOR" -c > "$out" ;;
   esac
 }
 
@@ -544,19 +531,19 @@ final_name=""
 if [ "$DISK_IMAGE_EXISTS" = "false" ] && [ -n "$CONTAINER_PUSH" ]; then
   echo "Container-only build completed. Container pushed to: $CONTAINER_PUSH"
   final_name="container:$CONTAINER_PUSH"
-elif [ -d "$(workspaces.shared-workspace.path)/${exportFile}" ]; then
+elif [ -d "$WORKSPACE_PATH/${exportFile}" ]; then
   echo "Preparing compressed parts for directory ${exportFile}..."
   final_compressed_name="${exportFile}${EXT_DIR}"
-  parts_dir="$(workspaces.shared-workspace.path)/${final_compressed_name}-parts"
+  parts_dir="$WORKSPACE_PATH/${final_compressed_name}-parts"
   mkdir -p "$parts_dir"
   (
-    cd "$(workspaces.shared-workspace.path)"
+    cd "$WORKSPACE_PATH"
     for item in "${exportFile}"/*; do
       [ -e "$item" ] || continue
       base=$(basename "$item")
       if [ -f "$item" ]; then
         # Record uncompressed size before compression (for OCI layer annotations)
-        uncompressed_size=$(stat -c%s "$item" 2>/dev/null || stat -f%z "$item" 2>/dev/null || echo "")
+        uncompressed_size=$($GET_SIZE_CMD "$item" 2>/dev/null || echo "")
         echo "Creating $parts_dir/${base}${EXT_FILE} (uncompressed: ${uncompressed_size:-unknown} bytes)"
         compress_file "$item" "$parts_dir/${base}${EXT_FILE}" || echo "Failed to create $parts_dir/${base}${EXT_FILE}"
         # Store uncompressed size in sidecar file for push_artifact.sh
@@ -570,28 +557,28 @@ elif [ -d "$(workspaces.shared-workspace.path)/${exportFile}" ]; then
     done
   )
   echo "Creating compressed archive ${final_compressed_name} in shared workspace..."
-  tar_dir "${exportFile}" "$(workspaces.shared-workspace.path)/${final_compressed_name}" || echo "Failed to create ${final_compressed_name}"
-  echo "Compressed archive size:" && ls -lah $(workspaces.shared-workspace.path)/${final_compressed_name} || true
-  if [ -f "$(workspaces.shared-workspace.path)/${final_compressed_name}" ]; then
+  tar_dir "${exportFile}" "$WORKSPACE_PATH/${final_compressed_name}" || echo "Failed to create ${final_compressed_name}"
+  echo "Compressed archive size:" && ls -lah "$WORKSPACE_PATH/${final_compressed_name}" || true
+  if [ -f "$WORKSPACE_PATH/${final_compressed_name}" ]; then
     echo "Removing uncompressed directory ${exportFile} (keeping parts directory)"
-    rm -rf "$(workspaces.shared-workspace.path)/${exportFile}"
-    pushd $(workspaces.shared-workspace.path)
+    rm -rf "$WORKSPACE_PATH/${exportFile}"
+    pushd "$WORKSPACE_PATH"
     ln -sf ${final_compressed_name} disk.img
     final_name="${final_compressed_name}"
     popd
     echo "Available artifacts:"
-    ls -la $(workspaces.shared-workspace.path)/ || true
-    if [ -d "$(workspaces.shared-workspace.path)/${final_compressed_name}-parts" ]; then
+    ls -la "$WORKSPACE_PATH/" || true
+    if [ -d "$WORKSPACE_PATH/${final_compressed_name}-parts" ]; then
       echo "Individual compressed parts in ${final_compressed_name}-parts/:"
-      ls -la "$(workspaces.shared-workspace.path)/${final_compressed_name}-parts/" || true
+      ls -la "$WORKSPACE_PATH/${final_compressed_name}-parts/" || true
     fi
   fi
-elif [ -f "$(workspaces.shared-workspace.path)/${exportFile}" ]; then
+elif [ -f "$WORKSPACE_PATH/${exportFile}" ]; then
   echo "Creating compressed file ${exportFile}${EXT_FILE} in shared workspace..."
-  compress_file "$(workspaces.shared-workspace.path)/${exportFile}" "$(workspaces.shared-workspace.path)/${exportFile}${EXT_FILE}" || echo "Failed to create ${exportFile}${EXT_FILE}"
-  echo "Compressed file size:" && ls -lah $(workspaces.shared-workspace.path)/${exportFile}${EXT_FILE} || true
-  if [ -f "$(workspaces.shared-workspace.path)/${exportFile}${EXT_FILE}" ]; then
-    pushd $(workspaces.shared-workspace.path)
+  compress_file "$WORKSPACE_PATH/${exportFile}" "$WORKSPACE_PATH/${exportFile}${EXT_FILE}" || echo "Failed to create ${exportFile}${EXT_FILE}"
+  echo "Compressed file size:" && ls -lah "$WORKSPACE_PATH/${exportFile}${EXT_FILE}" || true
+  if [ -f "$WORKSPACE_PATH/${exportFile}${EXT_FILE}" ]; then
+    pushd "$WORKSPACE_PATH"
     ln -sf ${exportFile}${EXT_FILE} disk.img
     final_name="${exportFile}${EXT_FILE}"
     popd
@@ -599,8 +586,6 @@ elif [ -f "$(workspaces.shared-workspace.path)/${exportFile}" ]; then
 fi
 
 if [ -z "$final_name" ]; then
-  workspace_path=$(workspaces.shared-workspace.path)
-
   # Try to find artifact with priority: compressed file > compressed dir > any file
   # This ensures we prefer compressed artifacts when compression is enabled
   patterns_to_try=(
@@ -614,15 +599,13 @@ if [ -z "$final_name" ]; then
     patterns_to_try=("${cleanName}*")
   fi
 
-  for pattern in "${patterns_to_try[@]}"; do
-    guess=$(ls -1 "${workspace_path}/${pattern}" 2>/dev/null | head -n1)
-    if [ -n "$guess" ]; then
-      final_name=$(basename "$guess")
-      echo "Fallback: using found artifact: $final_name"
-      break
-    fi
-  done
+  if final_name=$(find_artifact "$WORKSPACE_PATH" "${patterns_to_try[@]}"); then
+    echo "Fallback: using found artifact: $final_name"
+  fi
 fi
+
+emit_progress "Finalizing build" "$PROGRESS_TOTAL" "$PROGRESS_TOTAL"
+
 if [ -n "$final_name" ]; then
   echo "Writing artifact filename to Tekton result: $final_name"
   echo "$final_name" > /tekton/results/artifact-filename || echo "Failed to write Tekton result"
@@ -631,7 +614,6 @@ if [ -n "$final_name" ]; then
 else
   echo "Warning: final_name is empty, no artifact filename will be recorded"
 fi
-
 
 echo "Syncing filesystem to ensure all artifacts are written..."
 sync

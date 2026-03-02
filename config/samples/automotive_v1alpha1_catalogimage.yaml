@@ -1,0 +1,16 @@
+apiVersion: automotive.sdv.cloud.redhat.com/v1alpha1
+kind: CatalogImage
+metadata:
+  labels:
+    app.kubernetes.io/name: automotive-dev-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: catalogimage-sample
+spec:
+  registryUrl: quay.io/example/automotive-image:v1.0.0
+  metadata:
+    architecture: amd64
+    distro: autosd
+    bootc: true
+  tags:
+    - production
+    - stable

@@ -17,10 +17,17 @@ spec:
     pvcSize: "8Gi"
 
     # Optional: Use memory-backed volumes for faster builds
-    # Requires memoryVolumeSize to be set if enabled
+    # Default: false (disk-backed)
     # useMemoryVolumes: false
 
-    # Optional: Size limit for memory-backed volumes (only if useMemoryVolumes is true)
+    # Optional: Use memory-backed volumes for container storage
+    # Controls /var/lib/containers/storage, /run/osbuild, and /var/tmp volumes
+    # Default: false (disk-backed)
+    # Set to true for memory-backed storage (faster but uses more memory)
+    # useMemoryContainerStorage: false
+
+    # Optional: Size limit for memory-backed volumes
+    # Only used when useMemoryVolumes or useMemoryContainerStorage is true
     # Example: "2Gi"
     # memoryVolumeSize: "2Gi"
 

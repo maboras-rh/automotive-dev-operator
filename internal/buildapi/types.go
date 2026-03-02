@@ -131,6 +131,12 @@ type BuildRequest struct {
 	BuildDiskImage bool   `json:"buildDiskImage,omitempty"` // Build disk image from bootc container
 	ExportOCI      string `json:"exportOci,omitempty"`      // Registry URL to push disk as OCI artifact
 	BuilderImage   string `json:"builderImage,omitempty"`   // Custom builder image
+	RebuildBuilder bool   `json:"rebuildBuilder,omitempty"` // Force rebuild of bootc builder image
+
+	// Internal registry push configuration
+	UseInternalRegistry       bool   `json:"useInternalRegistry,omitempty"`       // Push to OpenShift internal registry
+	InternalRegistryImageName string `json:"internalRegistryImageName,omitempty"` // Override image name (default: build name)
+	InternalRegistryTag       string `json:"internalRegistryTag,omitempty"`       // Tag for internal registry image (default: build name)
 
 	// Flash configuration for Jumpstarter device flashing after build
 	FlashEnabled       bool   `json:"flashEnabled,omitempty"`       // Enable flashing after build
@@ -208,7 +214,30 @@ type BuildResponse struct {
 	RequestedBy    string           `json:"requestedBy,omitempty"`
 	StartTime      string           `json:"startTime,omitempty"`
 	CompletionTime string           `json:"completionTime,omitempty"`
+	ContainerImage string           `json:"containerImage,omitempty"`
+	DiskImage      string           `json:"diskImage,omitempty"`
+	RegistryToken  string           `json:"registryToken,omitempty"`
+	Warning        string           `json:"warning,omitempty"`
 	Jumpstarter    *JumpstarterInfo `json:"jumpstarter,omitempty"`
+	Parameters     *BuildParameters `json:"parameters,omitempty"`
+}
+
+// BuildParameters describes the key input parameters that produced an ImageBuild.
+type BuildParameters struct {
+	Architecture           string `json:"architecture,omitempty"`
+	Distro                 string `json:"distro,omitempty"`
+	Target                 string `json:"target,omitempty"`
+	Mode                   string `json:"mode,omitempty"`
+	ExportFormat           string `json:"exportFormat,omitempty"`
+	Compression            string `json:"compression,omitempty"`
+	StorageClass           string `json:"storageClass,omitempty"`
+	AutomotiveImageBuilder string `json:"automotiveImageBuilder,omitempty"`
+	BuilderImage           string `json:"builderImage,omitempty"`
+	ContainerRef           string `json:"containerRef,omitempty"`
+	BuildDiskImage         bool   `json:"buildDiskImage,omitempty"`
+	FlashEnabled           bool   `json:"flashEnabled,omitempty"`
+	FlashLeaseDuration     string `json:"flashLeaseDuration,omitempty"`
+	UseServiceAccountAuth  bool   `json:"useServiceAccountAuth,omitempty"`
 }
 
 // BuildListItem represents a build in the list API
@@ -220,6 +249,28 @@ type BuildListItem struct {
 	CreatedAt      string `json:"createdAt"`
 	StartTime      string `json:"startTime,omitempty"`
 	CompletionTime string `json:"completionTime,omitempty"`
+	ContainerImage string `json:"containerImage,omitempty"`
+	DiskImage      string `json:"diskImage,omitempty"`
+}
+
+// JumpstarterTarget contains flash-specific config for a target (from CRD)
+type JumpstarterTarget struct {
+	Selector string `json:"selector"`
+	FlashCmd string `json:"flashCmd,omitempty"`
+}
+
+// TargetDefaults contains build defaults for a target (from ConfigMap)
+type TargetDefaults struct {
+	Architecture string   `json:"architecture,omitempty"`
+	ExtraArgs    []string `json:"extraArgs,omitempty"`
+}
+
+// OperatorConfigResponse returns relevant operator configuration for CLI validation
+type OperatorConfigResponse struct {
+	// JumpstarterTargets contains flash-specific config per target (from CRD)
+	JumpstarterTargets map[string]JumpstarterTarget `json:"jumpstarterTargets,omitempty"`
+	// TargetDefaults contains build defaults per target (from ConfigMap)
+	TargetDefaults map[string]TargetDefaults `json:"targetDefaults,omitempty"`
 }
 
 type (
@@ -233,4 +284,129 @@ type (
 type BuildTemplateResponse struct {
 	BuildRequest `json:",inline"`
 	SourceFiles  []string `json:"sourceFiles,omitempty"`
+}
+
+// ContainerBuildRequest is the payload to create a container build via the REST API
+type ContainerBuildRequest struct {
+	// Name is the build identifier (auto-generated if omitted)
+	Name string `json:"name"`
+	// Output is the target image reference to push to (required)
+	Output string `json:"output"`
+	// Containerfile is the path within the context (default: "Containerfile")
+	Containerfile string `json:"containerfile,omitempty"`
+	// Strategy is the Shipwright build strategy name (default: "buildah")
+	Strategy string `json:"strategy,omitempty"`
+	// BuildArgs are --build-arg KEY=VALUE pairs
+	BuildArgs map[string]string `json:"buildArgs,omitempty"`
+	// Architecture is the target CPU architecture
+	Architecture string `json:"architecture,omitempty"`
+	// Timeout is the maximum build duration in minutes (default: 30)
+	Timeout int32 `json:"timeout,omitempty"`
+	// RegistryCredentials contains push authentication details
+	RegistryCredentials *RegistryCredentials `json:"registryCredentials,omitempty"`
+	// UseInternalRegistry indicates the build should push to the OpenShift internal registry
+	UseInternalRegistry bool `json:"useInternalRegistry,omitempty"`
+}
+
+// ContainerBuildResponse is returned by container build operations
+type ContainerBuildResponse struct {
+	Name           string `json:"name"`
+	Phase          string `json:"phase"`
+	Message        string `json:"message"`
+	RequestedBy    string `json:"requestedBy,omitempty"`
+	StartTime      string `json:"startTime,omitempty"`
+	CompletionTime string `json:"completionTime,omitempty"`
+	OutputImage    string `json:"outputImage,omitempty"`
+	ImageDigest    string `json:"imageDigest,omitempty"`
+	RegistryToken  string `json:"registryToken,omitempty"`
+}
+
+// ContainerBuildListItem represents a container build in the list API
+type ContainerBuildListItem struct {
+	Name           string `json:"name"`
+	Phase          string `json:"phase"`
+	Message        string `json:"message"`
+	RequestedBy    string `json:"requestedBy,omitempty"`
+	CreatedAt      string `json:"createdAt"`
+	CompletionTime string `json:"completionTime,omitempty"`
+	OutputImage    string `json:"outputImage,omitempty"`
+}
+
+// SealedOperation is the AIB sealed workflow operation to run
+type SealedOperation string
+
+// Sealed operation constants for each step in the AIB sealed workflow.
+const (
+	SealedPrepareReseal     SealedOperation = "prepare-reseal"
+	SealedReseal            SealedOperation = "reseal"
+	SealedExtractForSigning SealedOperation = "extract-for-signing"
+	SealedInjectSigned      SealedOperation = "inject-signed"
+)
+
+// SealedOperationAPIPath returns the v1 API path prefix for the given sealed operation.
+func SealedOperationAPIPath(op SealedOperation) string {
+	switch op {
+	case SealedPrepareReseal:
+		return "/v1/prepare-reseals"
+	case SealedReseal:
+		return "/v1/reseals"
+	case SealedExtractForSigning:
+		return "/v1/extract-for-signings"
+	case SealedInjectSigned:
+		return "/v1/inject-signeds"
+	default:
+		return "/v1/reseals"
+	}
+}
+
+// SealedRequest is the payload to create a sealed operation via the REST API
+type SealedRequest struct {
+	Name      string          `json:"name"`
+	Operation SealedOperation `json:"operation,omitempty"`
+	// Stages is an ordered list of operations (e.g. prepare-reseal, extract-for-signing, inject-signed, reseal). If set, Operation is ignored.
+	Stages []string `json:"stages,omitempty"`
+	// InputRef is the OCI reference to the input disk image (required)
+	InputRef string `json:"inputRef"`
+	// OutputRef is the OCI reference where to push the result (optional for extract-for-signing)
+	OutputRef string `json:"outputRef,omitempty"`
+	// SignedRef is the OCI reference to signed artifacts; required when operation is inject-signed
+	SignedRef    string `json:"signedRef,omitempty"`
+	AIBImage     string `json:"aibImage,omitempty"`
+	BuilderImage string `json:"builderImage,omitempty"`
+	// Architecture overrides the target architecture for the builder image (e.g., "amd64", "arm64").
+	Architecture        string               `json:"architecture,omitempty"`
+	StorageClass        string               `json:"storageClass,omitempty"`
+	AIBExtraArgs        []string             `json:"aibExtraArgs,omitempty"`
+	RegistryCredentials *RegistryCredentials `json:"registryCredentials,omitempty"`
+	// KeySecretRef is the name of an existing secret containing the sealing key (data key "private-key").
+	KeySecretRef string `json:"keySecretRef,omitempty"`
+	// KeyPasswordSecretRef is the name of an existing secret containing the key password (data key "password").
+	KeyPasswordSecretRef string `json:"keyPasswordSecretRef,omitempty"`
+	// KeyContent is the PEM-encoded private key content (alternative to KeySecretRef; server creates a transient secret).
+	KeyContent string `json:"keyContent,omitempty"`
+	// KeyPassword is the password for an encrypted key (used with KeyContent).
+	KeyPassword string `json:"keyPassword,omitempty"`
+}
+
+// SealedResponse is returned by POST and GET sealed operations
+type SealedResponse struct {
+	Name            string `json:"name"`
+	Phase           string `json:"phase"`
+	Message         string `json:"message"`
+	RequestedBy     string `json:"requestedBy,omitempty"`
+	StartTime       string `json:"startTime,omitempty"`
+	CompletionTime  string `json:"completionTime,omitempty"`
+	TaskRunName     string `json:"taskRunName,omitempty"`
+	PipelineRunName string `json:"pipelineRunName,omitempty"`
+	OutputRef       string `json:"outputRef,omitempty"`
+}
+
+// SealedListItem represents a sealed job in the list API
+type SealedListItem struct {
+	Name           string `json:"name"`
+	Phase          string `json:"phase"`
+	Message        string `json:"message"`
+	RequestedBy    string `json:"requestedBy,omitempty"`
+	CreatedAt      string `json:"createdAt"`
+	CompletionTime string `json:"completionTime,omitempty"`
 }

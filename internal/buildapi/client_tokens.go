@@ -16,25 +16,29 @@ import (
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 )
 
-const (
-	clientTokenPrefix = "ado-build-api-client-"
-	clientTokenExpiry = 30 * 24 * time.Hour
-)
+const clientTokenPrefix = "ado-build-api-client-"
 
-func (a *APIServer) authenticateExternalJWT(c *gin.Context, token string, authn authenticator.Token) (string, bool) {
+// oidcAuthResult represents the result of OIDC authentication attempt
+type oidcAuthResult struct {
+	username string
+	ok       bool
+	err      error
+}
+
+func (a *APIServer) authenticateExternalJWT(c *gin.Context, token string, authn authenticator.Token) oidcAuthResult {
 	resp, ok, err := authn.AuthenticateToken(c.Request.Context(), token)
 	if err != nil {
 		a.log.Error(err, "OIDC token validation failed")
-		return "", false
+		return oidcAuthResult{err: err}
 	}
 	if !ok || resp == nil || resp.User == nil {
-		return "", false
+		return oidcAuthResult{ok: false}
 	}
 	username := strings.TrimSpace(resp.User.GetName())
 	if username == "" {
-		return "", false
+		return oidcAuthResult{ok: false}
 	}
-	return username, true
+	return oidcAuthResult{username: username, ok: true}
 }
 
 func (a *APIServer) ensureClientTokenSecret(c *gin.Context, username string, oidcToken string) error {
@@ -99,7 +103,7 @@ func (a *APIServer) signClientToken(username string) (string, time.Time, error) 
 		return "", time.Time{}, fmt.Errorf("internal JWT is not configured")
 	}
 
-	expiresAt := time.Now().Add(clientTokenExpiry)
+	expiresAt := time.Now().Add(time.Duration(a.limits.ClientTokenExpiryDays) * 24 * time.Hour)
 	audience := a.internalJWT.audience
 	if audience == "" {
 		audience = "ado-build-api"

@@ -163,7 +163,7 @@ caib build-legacy <manifest.aib.yml> \
 
 ## Common Error Patterns
 
-- "Builder image not found" - prepare-builder task failed or result not passed
+- "Builder image not found" - builder preparation in build-image step failed or OCI image reference not propagated to the build step
 - "containers-storage: invalid reference" - skopeo copy using wrong format
 - "setfiles: Operation not supported" - SELinux context issues in osbuild
 - "unauthorized" - Token or registry auth issues

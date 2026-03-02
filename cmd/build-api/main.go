@@ -73,7 +73,6 @@ func main() {
 		"gin_mode", os.Getenv("GIN_MODE"),
 		"kubeconfig", os.Getenv("KUBECONFIG"),
 		"namespace", os.Getenv("BUILD_API_NAMESPACE"),
-		"maxManifestSize", limits.MaxManifestSize,
 		"maxUploadFileSize", limits.MaxUploadFileSize,
 		"maxTotalUploadSize", limits.MaxTotalUploadSize,
 		"maxLogStreamDurationMinutes", limits.MaxLogStreamDurationMinutes)

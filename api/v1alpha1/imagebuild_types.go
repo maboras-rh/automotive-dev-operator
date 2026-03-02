@@ -83,8 +83,12 @@ type AIBSpec struct {
 	// +kubebuilder:default=image
 	Mode string `json:"mode,omitempty"`
 
-	// ManifestConfigMap specifies the name of the ConfigMap containing the AIB manifest
-	ManifestConfigMap string `json:"manifestConfigMap,omitempty"`
+	// Manifest holds the inline AIB manifest YAML content
+	Manifest string `json:"manifest,omitempty" yaml:"manifest,omitempty"`
+
+	// ManifestFileName is the original filename of the manifest, used for naming the file
+	// when writing it to disk before invoking automotive-image-builder
+	ManifestFileName string `json:"manifestFileName,omitempty" yaml:"manifestFileName,omitempty"`
 
 	// Image specifies the automotive-image-builder container image to use
 	// If not specified, the default from OperatorConfig is used
@@ -94,6 +98,9 @@ type AIBSpec struct {
 	// If not specified for bootc builds, one is automatically built and cached
 	BuilderImage string `json:"builderImage,omitempty"`
 
+	// RebuildBuilder forces rebuilding the bootc builder image even if a cached version exists in the registry.
+	RebuildBuilder bool `json:"rebuildBuilder,omitempty"`
+
 	// InputFilesServer indicates if an upload server should be created for local file references
 	// When true, the build waits in "Uploading" phase until files are uploaded
 	InputFilesServer bool `json:"inputFilesServer,omitempty"`
@@ -101,6 +108,12 @@ type AIBSpec struct {
 	// ContainerRef is the reference to an existing bootc container image
 	// Required when mode=disk to create a disk image from an existing container
 	ContainerRef string `json:"containerRef,omitempty"`
+
+	// CustomDefs are custom environment variable definitions for the build
+	CustomDefs []string `json:"customDefs,omitempty"`
+
+	// AIBExtraArgs are extra arguments to pass to automotive-image-builder
+	AIBExtraArgs []string `json:"aibExtraArgs,omitempty"`
 }
 
 // ExportSpec defines the configuration for exporting build artifacts
@@ -119,6 +132,10 @@ type ExportSpec struct {
 
 	// Container is the OCI registry URL to push the bootc container image
 	Container string `json:"container,omitempty"`
+
+	// UseServiceAccountAuth indicates the build should authenticate to the registry
+	// using a service account token instead of explicit credentials
+	UseServiceAccountAuth bool `json:"useServiceAccountAuth,omitempty"`
 
 	// Disk contains configuration for disk image export
 	Disk *DiskExport `json:"disk,omitempty"`
@@ -237,10 +254,18 @@ func (s *ImageBuildSpec) GetMode() string {
 	return "image"
 }
 
-// GetManifestConfigMap returns the manifest ConfigMap name from AIB spec
-func (s *ImageBuildSpec) GetManifestConfigMap() string {
+// GetManifest returns the inline manifest YAML content from AIB spec
+func (s *ImageBuildSpec) GetManifest() string {
 	if s.AIB != nil {
-		return s.AIB.ManifestConfigMap
+		return s.AIB.Manifest
+	}
+	return ""
+}
+
+// GetManifestFileName returns the manifest filename from AIB spec
+func (s *ImageBuildSpec) GetManifestFileName() string {
+	if s.AIB != nil {
+		return s.AIB.ManifestFileName
 	}
 	return ""
 }
@@ -275,6 +300,22 @@ func (s *ImageBuildSpec) GetContainerRef() string {
 		return s.AIB.ContainerRef
 	}
 	return ""
+}
+
+// GetCustomDefs returns the custom environment variable definitions from AIB spec
+func (s *ImageBuildSpec) GetCustomDefs() []string {
+	if s.AIB != nil {
+		return s.AIB.CustomDefs
+	}
+	return nil
+}
+
+// GetAIBExtraArgs returns extra arguments to pass to automotive-image-builder
+func (s *ImageBuildSpec) GetAIBExtraArgs() []string {
+	if s.AIB != nil {
+		return s.AIB.AIBExtraArgs
+	}
+	return nil
 }
 
 // GetExportFormat returns the export format, or "qcow2" as default
@@ -320,6 +361,11 @@ func (s *ImageBuildSpec) GetExportOCI() string {
 		return s.Export.Disk.OCI
 	}
 	return ""
+}
+
+// GetUseServiceAccountAuth returns whether service account auth is enabled for registry push
+func (s *ImageBuildSpec) GetUseServiceAccountAuth() bool {
+	return s.Export != nil && s.Export.UseServiceAccountAuth
 }
 
 // HasDiskExport returns true if any disk export is configured
@@ -371,10 +417,18 @@ func (s *ImageBuildSpec) GetFlashClientConfigSecretRef() string {
 	return ""
 }
 
+// GetRebuildBuilder returns whether the builder image should be forcibly rebuilt
+func (s *ImageBuildSpec) GetRebuildBuilder() bool {
+	if s.AIB != nil {
+		return s.AIB.RebuildBuilder
+	}
+	return false
+}
+
 // GetFlashLeaseDuration returns the flash lease duration, or default
 func (s *ImageBuildSpec) GetFlashLeaseDuration() string {
 	if s.Flash != nil && s.Flash.LeaseDuration != "" {
 		return s.Flash.LeaseDuration
 	}
-	return "03:00:00"
+	return DefaultFlashLeaseDuration
 }

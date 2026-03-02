@@ -11,5 +11,5 @@ roleRef:
   name: leader-election-role
 subjects:
 - kind: ServiceAccount
-  name: ado-controller-manager
-  namespace: automotive-dev-operator-system
+  name: operator
+  namespace: system

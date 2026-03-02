@@ -1,6 +1,6 @@
-# Build the manager binary
-FROM registry.access.redhat.com/ubi9/go-toolset:1.24.6 AS builder
-ARG TARGETOS
+ARG BUILDPLATFORM
+FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/go-toolset:1.24.6 AS builder
+ARG TARGETOS=linux
 ARG TARGETARCH
 
 WORKDIR /workspace
@@ -26,7 +26,8 @@ RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -mod=vendor -trimpath -ldflag
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -mod=vendor -trimpath -ldflags "-s -w" -o build-api cmd/build-api/main.go
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -mod=vendor -trimpath -ldflags "-s -w" -o init-secrets cmd/init-secrets/main.go
 
-FROM gcr.io/distroless/static:nonroot
+# Runtime stage uses the target platform
+FROM --platform=$TARGETPLATFORM gcr.io/distroless/static:nonroot
 WORKDIR /
 COPY --from=builder /workspace/manager .
 COPY --from=builder /workspace/build-api .

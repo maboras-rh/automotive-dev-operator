@@ -2,7 +2,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: ado-manager-role
+  name: manager-role
 rules:
 - apiGroups:
   - ""
@@ -41,6 +41,7 @@ rules:
   - ""
   resources:
   - pods/exec
+  - serviceaccounts/token
   verbs:
   - create
 - apiGroups:
@@ -73,7 +74,9 @@ rules:
   - automotive.sdv.cloud.redhat.com
   resources:
   - catalogimages
+  - containerbuilds
   - imagebuilds
+  - imagereseals
   - images
   - operatorconfigs
   verbs:
@@ -88,7 +91,9 @@ rules:
   - automotive.sdv.cloud.redhat.com
   resources:
   - catalogimages/finalizers
+  - containerbuilds/finalizers
   - imagebuilds/finalizers
+  - imagereseals/finalizers
   - images/finalizers
   - operatorconfigs/finalizers
   verbs:
@@ -97,13 +102,22 @@ rules:
   - automotive.sdv.cloud.redhat.com
   resources:
   - catalogimages/status
+  - containerbuilds/status
   - imagebuilds/status
+  - imagereseals/status
   - images/status
   - operatorconfigs/status
   verbs:
   - get
   - patch
   - update
+- apiGroups:
+  - image.openshift.io
+  resources:
+  - imagestreams
+  verbs:
+  - create
+  - get
 - apiGroups:
   - networking.k8s.io
   resources:
@@ -122,6 +136,7 @@ rules:
   - clusterrolebindings
   - clusterroles
   - rolebindings
+  - roles
   verbs:
   - create
   - delete
@@ -143,9 +158,10 @@ rules:
   - update
   - watch
 - apiGroups:
-  - security.openshift.io
+  - shipwright.io
   resources:
-  - securitycontextconstraints
+  - buildruns
+  - builds
   verbs:
   - create
   - delete
@@ -153,7 +169,6 @@ rules:
   - list
   - patch
   - update
-  - use
   - watch
 - apiGroups:
   - tekton.dev

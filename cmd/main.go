@@ -20,6 +20,7 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
 
 	routev1 "github.com/openshift/api/route/v1"
@@ -29,6 +30,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -36,15 +38,24 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	securityv1 "github.com/openshift/api/security/v1"
+	shipwrightv1beta1 "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/catalogimage"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/containerbuild"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/image"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/imagebuild"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/imagereseal"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/operatorconfig"
 	// +kubebuilder:scaffold:imports
+)
+
+const (
+	modeAll      = "all"
+	modePlatform = "platform"
+	modeBuild    = "build"
 )
 
 var (
@@ -60,6 +71,7 @@ func init() {
 	utilruntime.Must(tektonv1.AddToScheme(scheme))
 	utilruntime.Must(routev1.Install(scheme))
 	utilruntime.Must(apiextensionsv1.AddToScheme(scheme))
+	utilruntime.Must(shipwrightv1beta1.SchemeBuilder.AddToScheme(scheme))
 
 	// +kubebuilder:scaffold:scheme
 }
@@ -70,6 +82,7 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var mode string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -81,6 +94,10 @@ func main() {
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.StringVar(&mode, "mode", modeAll,
+		"Controller mode: 'platform' runs only OperatorConfig controller, "+
+			"'build' runs only ImageBuild/Image/CatalogImage/ContainerBuild controllers, "+
+			"'all' runs all controllers.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -88,6 +105,11 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if mode != modeAll && mode != modePlatform && mode != modeBuild {
+		setupLog.Error(fmt.Errorf("invalid mode %q", mode), "mode must be one of: all, platform, build")
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -131,61 +153,128 @@ func main() {
 		// https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.19.0/pkg/metrics/filters#WithAuthenticationAndAuthorization
 		metricsServerOptions.FilterProvider = filters.WithAuthenticationAndAuthorization
 	}
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	leaderElectionID := "930f6355.sdv.cloud.redhat.com"
+	if mode == modeBuild {
+		leaderElectionID = "930f6355-build.sdv.cloud.redhat.com"
+	}
+
+	// Expose mode to controllers so they can adjust behavior (e.g., skip deploying
+	// a separate build controller when all controllers run in-process).
+	if err := os.Setenv("OPERATOR_MODE", mode); err != nil {
+		setupLog.Error(err, "unable to set OPERATOR_MODE")
+		os.Exit(1)
+	}
+
+	// Support namespace-scoped operation for multi-instance deployment
+	watchNamespace := os.Getenv("WATCH_NAMESPACE")
+	if watchNamespace != "" {
+		setupLog.Info("configuring namespace-scoped operation", "namespace", watchNamespace)
+	} else {
+		setupLog.Info("configuring cluster-scoped operation")
+	}
+
+	setupLog.Info("starting controller", "mode", mode, "leaderElectionID", leaderElectionID)
+
+	mgrOptions := ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "930f6355.sdv.cloud.redhat.com",
-	})
+		LeaderElectionID:       leaderElectionID,
+	}
+
+	// Set namespace scope if specified
+	if watchNamespace != "" {
+		mgrOptions.Cache = cache.Options{
+			DefaultNamespaces: map[string]cache.Config{
+				watchNamespace: {},
+			},
+		}
+	}
+
+	restConfig := ctrl.GetConfigOrDie()
+	// controller-runtime v0.21.0 no longer sets client-side rate limits by default.
+	// Restore the previous defaults to avoid throttling under the more restrictive
+	// client-go defaults (QPS=5, Burst=10).
+	restConfig.QPS = 20
+	restConfig.Burst = 30
+	mgr, err := ctrl.NewManager(restConfig, mgrOptions)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
 
-	imageBuildReconciler := &imagebuild.ImageBuildReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Log:    ctrl.Log.WithName("controllers").WithName("ImageBuild"),
+	// Register controllers based on mode
+	if mode == modePlatform || mode == modeAll {
+		operatorConfigReconciler := &operatorconfig.OperatorConfigReconciler{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+			Log:    ctrl.Log.WithName("controllers").WithName("OperatorConfig"),
+		}
+
+		if err = operatorConfigReconciler.SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "OperatorConfig")
+			os.Exit(1)
+		}
 	}
 
-	if err = imageBuildReconciler.SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "ImageBuild")
-		os.Exit(1)
-	}
+	if mode == modeBuild || mode == modeAll {
+		imageBuildReconciler := &imagebuild.ImageBuildReconciler{
+			Client:     mgr.GetClient(),
+			APIReader:  mgr.GetAPIReader(),
+			Scheme:     mgr.GetScheme(),
+			Log:        ctrl.Log.WithName("controllers").WithName("ImageBuild"),
+			RestConfig: mgr.GetConfig(),
+		}
 
-	imageReconciler := &image.ImageReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Log:    ctrl.Log.WithName("controllers").WithName("Image"),
-	}
+		if err = imageBuildReconciler.SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "ImageBuild")
+			os.Exit(1)
+		}
 
-	if err = imageReconciler.SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Image")
-		os.Exit(1)
-	}
+		imageReconciler := &image.ImageReconciler{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+			Log:    ctrl.Log.WithName("controllers").WithName("Image"),
+		}
 
-	operatorConfigReconciler := &operatorconfig.OperatorConfigReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Log:    ctrl.Log.WithName("controllers").WithName("OperatorConfig"),
-	}
+		if err = imageReconciler.SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "Image")
+			os.Exit(1)
+		}
 
-	if err = operatorConfigReconciler.SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "OperatorConfig")
-		os.Exit(1)
-	}
+		catalogImageReconciler := &catalogimage.CatalogImageReconciler{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+			Log:    ctrl.Log.WithName("controllers").WithName("CatalogImage"),
+		}
 
-	catalogImageReconciler := &catalogimage.CatalogImageReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Log:    ctrl.Log.WithName("controllers").WithName("CatalogImage"),
-	}
+		if err = catalogImageReconciler.SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "CatalogImage")
+			os.Exit(1)
+		}
 
-	if err = catalogImageReconciler.SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "CatalogImage")
-		os.Exit(1)
+		containerBuildReconciler := &containerbuild.ContainerBuildReconciler{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+			Log:    ctrl.Log.WithName("controllers").WithName("ContainerBuild"),
+		}
+
+		if err = containerBuildReconciler.SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "ContainerBuild")
+			os.Exit(1)
+		}
+
+		imageResealReconciler := &imagereseal.Reconciler{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+			Log:    ctrl.Log.WithName("controllers").WithName("ImageReseal"),
+		}
+		if err = imageResealReconciler.SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "ImageReseal")
+			os.Exit(1)
+		}
 	}
 
 	// Health checks

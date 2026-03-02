@@ -1,0 +1,16 @@
+apiVersion: automotive.sdv.cloud.redhat.com/v1alpha1
+kind: Image
+metadata:
+  labels:
+    app.kubernetes.io/name: automotive-dev-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: image-sample
+spec:
+  architecture: amd64
+  distro: autosd
+  target: qemu
+  exportFormat: qcow2
+  location:
+    type: registry
+    registry:
+      url: quay.io/example/automotive-image:v1.0.0

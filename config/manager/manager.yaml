@@ -2,7 +2,7 @@ apiVersion: v1
 kind: Namespace
 metadata:
   labels:
-    control-plane: controller-manager
+    control-plane: operator
     app.kubernetes.io/name: automotive-dev-operator
     app.kubernetes.io/managed-by: kustomize
   name: system
@@ -10,23 +10,23 @@ metadata:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: controller-manager
+  name: operator
   namespace: system
   labels:
-    control-plane: controller-manager
+    control-plane: operator
     app.kubernetes.io/name: automotive-dev-operator
     app.kubernetes.io/managed-by: kustomize
 spec:
   selector:
     matchLabels:
-      control-plane: controller-manager
+      control-plane: operator
   replicas: 1
   template:
     metadata:
       annotations:
         kubectl.kubernetes.io/default-container: manager
       labels:
-        control-plane: controller-manager
+        control-plane: operator
     spec:
       affinity:
         nodeAffinity:
@@ -77,6 +77,7 @@ spec:
       - command:
         - /manager
         args:
+          - --mode=all
           - --leader-elect
           - --health-probe-bind-address=:8081
           - --metrics-bind-address=0
@@ -87,8 +88,12 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        - name: WATCH_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         - name: OPERATOR_IMAGE
-          value: controller:latest
+          value: quay.io/rh-sdv-cloud/automotive-dev-operator:latest
         ports:
         - containerPort: 8080
           name: build-api
@@ -118,5 +123,5 @@ spec:
           requests:
             cpu: 100m
             memory: 256Mi
-      serviceAccountName: controller-manager
+      serviceAccountName: operator
       terminationGracePeriodSeconds: 10

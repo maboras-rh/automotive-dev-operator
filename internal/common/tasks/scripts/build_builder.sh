@@ -1,5 +1,4 @@
-#!/bin/sh
-set -e
+# NOTE: common.sh is prepended to this script at embed time.
 
 echo "Prepare builder for distro: $DISTRO, arch: $TARGET_ARCH"
 
@@ -10,125 +9,60 @@ if [ -n "$BUILDER_IMAGE" ]; then
   exit 0
 fi
 
-# Set up cluster registry details
-TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
-NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)
-
+# Determine registry and set up authentication
 if [ -n "$CLUSTER_REGISTRY_ROUTE" ]; then
   echo "Using external registry route: $CLUSTER_REGISTRY_ROUTE"
-  REGISTRY="$CLUSTER_REGISTRY_ROUTE"
-else
-  REGISTRY="image-registry.openshift-image-registry.svc:5000"
 fi
+setup_cluster_auth "${CLUSTER_REGISTRY_ROUTE:-}"
 
-TARGET_IMAGE="${REGISTRY}/${NAMESPACE}/aib-build:${DISTRO}-${TARGET_ARCH}"
+# Include a short hash of the AIB image in the registry tag so that different
+# AIB versions cache their builder images separately and don't overwrite each other.
+AIB_HASH=$(echo -n "$AIB_IMAGE" | sha256sum | cut -c1-8)
+TARGET_IMAGE="${REGISTRY}/${NAMESPACE}/aib-build:${DISTRO}-${TARGET_ARCH}-${AIB_HASH}"
+echo "AIB image: $AIB_IMAGE (hash: $AIB_HASH)"
 
-mkdir -p $HOME/.config
-cat > $HOME/.authjson <<EOF
-{
-  "auths": {
-    "$REGISTRY": {
-      "auth": "$(echo -n "serviceaccount:$TOKEN" | base64 -w0)"
-    }
-  }
-}
-EOF
-export REGISTRY_AUTH_FILE=$HOME/.authjson
+setup_container_config
+setup_var_tmp
 
-# Make internal registry trusted (fallback for internal service)
-mkdir -p /etc/containers
-cat > /etc/containers/registries.conf << EOF
-[registries.insecure]
-registries = ['image-registry.openshift-image-registry.svc:5000']
-EOF
+# Local target name for pushing to registry
+LOCAL_TARGET="localhost/aib-build:${DISTRO}-${TARGET_ARCH}-${AIB_HASH}"
 
-# Configure fuse-overlayfs for nested container builds
-if [ -e /dev/fuse ]; then
-  if ! command -v fuse-overlayfs >/dev/null 2>&1; then
-    echo "Installing fuse-overlayfs..."
-    dnf install -y fuse-overlayfs 2>/dev/null || yum install -y fuse-overlayfs 2>/dev/null || true
-  fi
+# Builder has 3 steps: check cache, build, push to registry
+BUILDER_TOTAL=3
 
-  if command -v fuse-overlayfs >/dev/null 2>&1; then
-    echo "Configuring fuse-overlayfs for container storage..."
-    cat > /etc/containers/storage.conf << EOF
-[storage]
-driver = "overlay"
-runroot = "/run/containers/storage"
-graphroot = "/var/lib/containers/storage"
-
-[storage.options.overlay]
-mount_program = "/usr/bin/fuse-overlayfs"
-EOF
-  else
-    echo "Warning: fuse-overlayfs install failed, using vfs driver"
-    export STORAGE_DRIVER=vfs
-  fi
-else
-  echo "Warning: /dev/fuse not available, using vfs driver"
-  export STORAGE_DRIVER=vfs
-fi
-
-# Local image name (what we'll actually use - nested containers can access this)
-LOCAL_IMAGE="localhost/aib-build:${DISTRO}-${TARGET_ARCH}"
+emit_progress "Checking builder cache" 0 "$BUILDER_TOTAL"
 
 # Check if image already exists in cluster registry
-echo "Checking if $TARGET_IMAGE exists in cluster registry..."
-if skopeo inspect --authfile="$REGISTRY_AUTH_FILE" "docker://$TARGET_IMAGE" >/dev/null 2>&1; then
-  echo "Builder image found in cluster registry: $TARGET_IMAGE"
-  echo -n "$TARGET_IMAGE" > "$RESULT_PATH"
-  exit 0
+if [ "$REBUILD_BUILDER" = "true" ]; then
+  echo "Rebuild requested, skipping cache check"
+else
+  echo "Checking if $TARGET_IMAGE exists in cluster registry..."
+  if skopeo inspect --authfile="$REGISTRY_AUTH_FILE" "docker://$TARGET_IMAGE" >/dev/null 2>&1; then
+    echo "Builder image found in cluster registry: $TARGET_IMAGE"
+    emit_progress "Builder cached" "$BUILDER_TOTAL" "$BUILDER_TOTAL"
+    echo -n "$TARGET_IMAGE" > "$RESULT_PATH"
+    exit 0
+  fi
 fi
 
 echo "Builder image not found, building..."
 
-# Set up SELinux contexts for osbuild
-osbuildPath="/usr/bin/osbuild"
-storePath="/_build"
-runTmp="/run/osbuild/"
+install_custom_ca_certs
+setup_osbuild
 
-mkdir -p "$storePath"
-mkdir -p "$runTmp"
+load_custom_definitions "$(workspaces.manifest-config-workspace.path)/custom-definitions.env"
 
-rootType="system_u:object_r:root_t:s0"
-chcon "$rootType" "$storePath" || true
+emit_progress "Building builder image" 1 "$BUILDER_TOTAL"
+echo "Running: aib build-builder --distro $DISTRO ${CUSTOM_DEFS_ARGS[*]} $LOCAL_TARGET"
+aib --verbose build-builder --distro "$DISTRO" "${CUSTOM_DEFS_ARGS[@]}" "$LOCAL_TARGET"
 
-installType="system_u:object_r:install_exec_t:s0"
-if ! mountpoint -q "$runTmp"; then
-  mount -t tmpfs tmpfs "$runTmp"
-fi
-
-destPath="$runTmp/osbuild"
-cp -p "$osbuildPath" "$destPath"
-chcon "$installType" "$destPath" || true
-
-mount --bind "$destPath" "$osbuildPath"
-
-echo "Running: aib build-builder --distro $DISTRO"
-aib --verbose build-builder --distro "$DISTRO"
-
-# Find what image was actually created by aib (it might use distro-target naming)
-echo "Checking for created builder images..."
-ACTUAL_IMAGE=""
-for img in $(podman images --format "{{.Repository}}:{{.Tag}}" | grep "localhost/aib-build:"); do
-    echo "Found image: $img"
-    if [[ "$img" == *"$DISTRO"* ]]; then
-        ACTUAL_IMAGE="$img"
-        echo "Using image: $ACTUAL_IMAGE"
-        break
-    fi
-done
-
-if [ -z "$ACTUAL_IMAGE" ]; then
-    echo "ERROR: Could not find builder image containing '$DISTRO'"
-    podman images | grep aib-build || echo "No aib-build images found"
-    exit 1
-fi
-
+echo "Built local image: $LOCAL_TARGET"
+emit_progress "Pushing builder to registry" 2 "$BUILDER_TOTAL"
 echo "Pushing to cluster registry: $TARGET_IMAGE"
 skopeo copy --authfile="$REGISTRY_AUTH_FILE" \
-  "containers-storage:$ACTUAL_IMAGE" \
+  "containers-storage:$LOCAL_TARGET" \
   "docker://$TARGET_IMAGE"
 
+emit_progress "Builder ready" "$BUILDER_TOTAL" "$BUILDER_TOTAL"
 echo "Builder image ready: $TARGET_IMAGE"
 echo -n "$TARGET_IMAGE" > "$RESULT_PATH"

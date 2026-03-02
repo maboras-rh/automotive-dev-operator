@@ -3,7 +3,9 @@ package imagebuild
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"strings"
 	"time"
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
@@ -12,15 +14,19 @@ import (
 	routev1 "github.com/openshift/api/route/v1"
 	pod "github.com/tektoncd/pipeline/pkg/apis/pipeline/pod"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
+	authnv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	kuberneteslib "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 const (
@@ -30,15 +36,48 @@ const (
 	// Phase constants for ImageBuild status
 	phaseCompleted = "Completed"
 	phaseFailed    = "Failed"
+
+	// Tekton condition type for completion status
+	conditionSucceeded = "Succeeded"
+
+	maxK8sNameLength = 63
 )
+
+// safeDerivedName generates a Kubernetes-safe derived resource name by truncating
+// the base name and appending a hash to preserve uniqueness. The final name will
+// never exceed maxK8sNameLength (63 chars for DNS label names) characters.
+func safeDerivedName(baseName, suffix string) string {
+	maxBaseLength := maxK8sNameLength - len(suffix) - 9
+
+	if maxBaseLength >= len(baseName) {
+		return fmt.Sprintf("%s%s", baseName, suffix)
+	}
+
+	hash := sha256.Sum256([]byte(baseName))
+	hexHash := fmt.Sprintf("%x", hash[:4]) // 8-char hex
+
+	if maxBaseLength <= 0 {
+		// suffix + hash overhead exceed the limit; use hex hash + suffix only
+		name := hexHash + suffix
+		if len(name) > maxK8sNameLength {
+			name = name[:maxK8sNameLength]
+		}
+		return name
+	}
+
+	truncated := baseName[:maxBaseLength]
+	return fmt.Sprintf("%s-%s%s", truncated, hexHash, suffix)
+}
 
 // ImageBuildReconciler reconciles a ImageBuild object
 //
 //nolint:revive // Name follows Kubebuilder convention for reconcilers
 type ImageBuildReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	Log    logr.Logger
+	APIReader  client.Reader
+	Scheme     *runtime.Scheme
+	Log        logr.Logger
+	RestConfig *rest.Config
 }
 
 // +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=imagebuilds,verbs=get;list;watch;create;update;patch;delete
@@ -49,9 +88,8 @@ type ImageBuildReconciler struct {
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=security.openshift.io,resources=securitycontextconstraints,verbs=get;list;watch;create;update;patch;delete;use
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=serviceaccounts/token,verbs=create
+// +kubebuilder:rbac:groups=image.openshift.io,resources=imagestreams,verbs=get;create
 // +kubebuilder:rbac:groups=tekton.dev,resources=tasks;pipelines;pipelineruns;taskruns,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
@@ -127,6 +165,29 @@ func (r *ImageBuildReconciler) handleUploadingState(
 		"imagebuild",
 		types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace},
 	)
+
+	// Fail the build if uploads have not completed within the configured timeout
+	uploadTimeout := 30 * time.Minute // default
+	operatorConfig := &automotivev1alpha1.OperatorConfig{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "config", Namespace: OperatorNamespace}, operatorConfig); err == nil {
+		if operatorConfig.Spec.OSBuilds != nil && operatorConfig.Spec.OSBuilds.UploadTimeoutMinutes > 0 {
+			uploadTimeout = time.Duration(operatorConfig.Spec.OSBuilds.UploadTimeoutMinutes) * time.Minute
+		}
+	}
+	if time.Since(imageBuild.CreationTimestamp.Time) > uploadTimeout {
+		log.Info("Upload timed out", "age", time.Since(imageBuild.CreationTimestamp.Time), "timeout", uploadTimeout)
+		r.cleanupTransientSecrets(ctx, imageBuild, r.Log)
+		if err := r.shutdownUploadPod(ctx, imageBuild); err != nil {
+			log.Error(err, "Failed to shutdown upload pod during timeout cleanup")
+		}
+		timeoutMinutes := int(uploadTimeout.Minutes())
+		if err := r.updateStatus(ctx, imageBuild, phaseFailed,
+			fmt.Sprintf("Upload timed out: file uploads were not completed within %d minutes", timeoutMinutes)); err != nil {
+			log.Error(err, "Failed to update status to Failed")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
 
 	uploadsComplete := imageBuild.Annotations != nil &&
 		imageBuild.Annotations["automotive.sdv.cloud.redhat.com/uploads-complete"] == "true"
@@ -279,7 +340,7 @@ func (r *ImageBuildReconciler) checkBuildProgress(
 	// Build failed - cleanup transient secrets
 	r.cleanupTransientSecrets(ctx, imageBuild, r.Log)
 
-	if err := r.updateStatus(ctx, imageBuild, phaseFailed, "Build failed"); err != nil {
+	if err := r.updateStatus(ctx, imageBuild, phaseFailed, pipelineRunFailureMessage(pipelineRun)); err != nil {
 		log.Error(err, "Failed to update status to Failed")
 		return ctrl.Result{}, err
 	}
@@ -319,10 +380,15 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 	if err == nil && operatorConfig.Spec.OSBuilds != nil {
 		// Convert OSBuildsConfig to BuildConfig
 		buildConfig = &tasks.BuildConfig{
-			UseMemoryVolumes: operatorConfig.Spec.OSBuilds.UseMemoryVolumes,
-			MemoryVolumeSize: operatorConfig.Spec.OSBuilds.MemoryVolumeSize,
-			PVCSize:          operatorConfig.Spec.OSBuilds.PVCSize,
-			RuntimeClassName: operatorConfig.Spec.OSBuilds.RuntimeClassName,
+			UseMemoryVolumes:            operatorConfig.Spec.OSBuilds.UseMemoryVolumes,
+			MemoryVolumeSize:            operatorConfig.Spec.OSBuilds.MemoryVolumeSize,
+			PVCSize:                     operatorConfig.Spec.OSBuilds.PVCSize,
+			RuntimeClassName:            operatorConfig.Spec.OSBuilds.RuntimeClassName,
+			AutomotiveImageBuilderImage: operatorConfig.Spec.GetImages().GetAutomotiveImageBuilderImage(),
+			YQHelperImage:               operatorConfig.Spec.GetImages().GetYQHelperImage(),
+			BuildTimeoutMinutes:         operatorConfig.Spec.OSBuilds.GetBuildTimeoutMinutes(),
+			FlashTimeoutMinutes:         operatorConfig.Spec.OSBuilds.GetFlashTimeoutMinutes(),
+			DefaultLeaseDuration:        operatorConfig.Spec.Jumpstarter.GetDefaultLeaseDuration(),
 		}
 	}
 	_ = buildConfig // buildConfig used for RuntimeClassName if needed
@@ -409,6 +475,13 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 			},
 		},
 		{
+			Name: "rebuild-builder",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: fmt.Sprintf("%t", imageBuild.Spec.GetRebuildBuilder()),
+			},
+		},
+		{
 			Name: "secret-ref",
 			Value: tektonv1.ParamValue{
 				Type:      tektonv1.ParamTypeString,
@@ -418,12 +491,16 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 	}
 
 	clusterRegistryRoute := ""
+	routeReader := r.APIReader
+	if routeReader == nil {
+		routeReader = r.Client
+	}
 	if operatorConfig.Spec.OSBuilds != nil && operatorConfig.Spec.OSBuilds.ClusterRegistryRoute != "" {
 		clusterRegistryRoute = operatorConfig.Spec.OSBuilds.ClusterRegistryRoute
 	} else {
 		route := &routev1.Route{}
 		routeNS := types.NamespacedName{Name: "default-route", Namespace: "openshift-image-registry"}
-		if err := r.Get(ctx, routeNS, route); err == nil {
+		if err := routeReader.Get(ctx, routeNS, route); err == nil {
 			clusterRegistryRoute = route.Spec.Host
 			log.Info("Auto-detected cluster registry route", "route", clusterRegistryRoute)
 		}
@@ -437,7 +514,7 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 			},
 		})
 
-		// Let prepare-builder task handle building the image automatically
+		// build-image handles building the builder image inline
 		// when builder-image is empty for bootc builds
 	}
 
@@ -453,7 +530,7 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 	}
 
 	// Add flash params if flash is enabled
-	var flashExporterSelector, flashCmd string
+	var flashExporterSelector, flashCmd, flashOCIAuthSecretName string
 	if imageBuild.Spec.IsFlashEnabled() {
 		target := imageBuild.Spec.GetTarget()
 		if operatorConfig.Spec.Jumpstarter != nil {
@@ -466,6 +543,117 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 			return fmt.Errorf("flash enabled but no Jumpstarter target mapping found for target %q; "+
 				"configure OperatorConfig.spec.jumpstarter.targetMappings[%q] with selector and flashCmd", target, target)
 		}
+		// Internal registry references are cluster-internal and not reachable by the flash exporter.
+		// Require an external route and fail fast if unavailable.
+		if imageBuild.Spec.GetUseServiceAccountAuth() && clusterRegistryRoute == "" {
+			return fmt.Errorf(
+				"flash with internal registry requires an external registry route; " +
+					"set OperatorConfig.spec.osBuilds.clusterRegistryRoute or expose openshift-image-registry/default-route",
+			)
+		}
+
+		// Resolve the flash image ref — for internal registry builds, translate to external URL.
+		flashImageRef := imageBuild.Spec.GetExportOCI()
+		flashOCIAuthSecretName = ""
+		if imageBuild.Spec.GetUseServiceAccountAuth() && flashImageRef != "" {
+			flashImageRef = strings.Replace(flashImageRef,
+				tasks.DefaultInternalRegistryURL,
+				clusterRegistryRoute, 1)
+			// Create a Secret with SA token credentials for the flash exporter
+			if r.RestConfig == nil {
+				return fmt.Errorf("RestConfig is nil, cannot create flash OCI credentials")
+			}
+			clientset, err := kuberneteslib.NewForConfig(r.RestConfig)
+			if err != nil {
+				return fmt.Errorf("failed to create clientset for flash OCI credentials: %w", err)
+			}
+			expSeconds := int64(4 * 3600)
+			tokenReq := &authnv1.TokenRequest{
+				Spec: authnv1.TokenRequestSpec{
+					ExpirationSeconds: &expSeconds,
+				},
+			}
+			tokenResp, err := clientset.CoreV1().ServiceAccounts(imageBuild.Namespace).
+				CreateToken(ctx, "pipeline", tokenReq, metav1.CreateOptions{})
+			if err != nil {
+				return fmt.Errorf("failed to create SA token for flash OCI credentials: %w", err)
+			}
+			flashOCIAuthSecretName = imageBuild.Name + "-flash-oci-auth"
+			ociSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      flashOCIAuthSecretName,
+					Namespace: imageBuild.Namespace,
+					Labels: map[string]string{
+						"app.kubernetes.io/managed-by":                  "automotive-dev-operator",
+						"app.kubernetes.io/part-of":                     "automotive-dev",
+						"automotive.sdv.cloud.redhat.com/build-name":    imageBuild.Name,
+						"automotive.sdv.cloud.redhat.com/transient":     "true",
+						"automotive.sdv.cloud.redhat.com/resource-type": "flash-oci-auth",
+					},
+					OwnerReferences: []metav1.OwnerReference{
+						*metav1.NewControllerRef(imageBuild, automotivev1alpha1.GroupVersion.WithKind("ImageBuild")),
+					},
+				},
+				Type: corev1.SecretTypeOpaque,
+				Data: map[string][]byte{
+					"username": []byte("serviceaccount"),
+					"password": []byte(tokenResp.Status.Token),
+				},
+			}
+			if _, err := clientset.CoreV1().Secrets(imageBuild.Namespace).Create(ctx, ociSecret, metav1.CreateOptions{}); err != nil && !errors.IsAlreadyExists(err) {
+				return fmt.Errorf("failed to create flash OCI auth secret: %w", err)
+			}
+		} else if imageBuild.Spec.SecretRef != "" && flashImageRef != "" {
+			// External registry: read credentials from the registry-auth secret and
+			// create a flash-oci-auth secret with username/password keys that the
+			// flash script expects.
+			registrySecret := &corev1.Secret{}
+			if err := r.Get(ctx, client.ObjectKey{
+				Namespace: imageBuild.Namespace,
+				Name:      imageBuild.Spec.SecretRef,
+			}, registrySecret); err != nil {
+				return fmt.Errorf("failed to read registry secret %q for flash OCI credentials: %w", imageBuild.Spec.SecretRef, err)
+			}
+			regUser := registrySecret.Data["REGISTRY_USERNAME"]
+			regPass := registrySecret.Data["REGISTRY_PASSWORD"]
+			hasUser := len(regUser) > 0
+			hasPass := len(regPass) > 0
+			if hasUser && hasPass {
+				flashOCIAuthSecretName = imageBuild.Name + "-flash-oci-auth"
+				ociSecret := &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      flashOCIAuthSecretName,
+						Namespace: imageBuild.Namespace,
+						Labels: map[string]string{
+							"app.kubernetes.io/managed-by":                  "automotive-dev-operator",
+							"app.kubernetes.io/part-of":                     "automotive-dev",
+							"automotive.sdv.cloud.redhat.com/build-name":    imageBuild.Name,
+							"automotive.sdv.cloud.redhat.com/transient":     "true",
+							"automotive.sdv.cloud.redhat.com/resource-type": "flash-oci-auth",
+						},
+						OwnerReferences: []metav1.OwnerReference{
+							*metav1.NewControllerRef(imageBuild, automotivev1alpha1.GroupVersion.WithKind("ImageBuild")),
+						},
+					},
+					Type: corev1.SecretTypeOpaque,
+					Data: map[string][]byte{
+						"username": regUser,
+						"password": regPass,
+					},
+				}
+				if err := r.Create(ctx, ociSecret); err != nil && !errors.IsAlreadyExists(err) {
+					return fmt.Errorf("failed to create flash OCI auth secret from registry credentials: %w", err)
+				}
+			} else if hasUser || hasPass {
+				missing := "REGISTRY_PASSWORD"
+				if !hasUser {
+					missing = "REGISTRY_USERNAME"
+				}
+				log.Info("Partial registry credentials in secret, skipping flash OCI auth",
+					"secret", imageBuild.Spec.SecretRef, "missing", missing)
+			}
+		}
+
 		params = append(params,
 			tektonv1.Param{
 				Name:  "flash-enabled",
@@ -473,7 +661,7 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 			},
 			tektonv1.Param{
 				Name:  "flash-image-ref",
-				Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: imageBuild.Spec.GetExportOCI()},
+				Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: flashImageRef},
 			},
 			tektonv1.Param{
 				Name:  "flash-exporter-selector",
@@ -492,6 +680,7 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 				Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: operatorConfig.Spec.Jumpstarter.GetJumpstarterImage()},
 			},
 		)
+
 	}
 
 	// Determine the shared-workspace binding:
@@ -533,13 +722,19 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 		}
 	}
 
+	// Create an internal ConfigMap from the inline manifest content
+	manifestConfigMapName, err := r.createOrUpdateManifestConfigMap(ctx, imageBuild)
+	if err != nil {
+		return fmt.Errorf("failed to create manifest ConfigMap: %w", err)
+	}
+
 	pipelineWorkspaces := []tektonv1.WorkspaceBinding{
 		sharedWorkspaceBinding,
 		{
 			Name: "manifest-config-workspace",
 			ConfigMap: &corev1.ConfigMapVolumeSource{
 				LocalObjectReference: corev1.LocalObjectReference{
-					Name: imageBuild.Spec.GetManifestConfigMap(),
+					Name: manifestConfigMapName,
 				},
 			},
 		},
@@ -561,6 +756,14 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 				SecretName: imageBuild.Spec.GetFlashClientConfigSecretRef(),
 			},
 		})
+		if flashOCIAuthSecretName != "" {
+			pipelineWorkspaces = append(pipelineWorkspaces, tektonv1.WorkspaceBinding{
+				Name: "flash-oci-auth",
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: flashOCIAuthSecretName,
+				},
+			})
+		}
 	}
 
 	nodeAffinity := &corev1.NodeAffinity{
@@ -598,7 +801,7 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 	}
 	pipelineRun := &tektonv1.PipelineRun{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: fmt.Sprintf("%s-build-", imageBuild.Name),
+			GenerateName: safeDerivedName(imageBuild.Name, "-build-"),
 			Namespace:    imageBuild.Namespace,
 			Labels: map[string]string{
 				tektonv1.ManagedByLabelKey:                        "automotive-dev-operator",
@@ -644,6 +847,53 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 	return nil
 }
 
+// createOrUpdateManifestConfigMap creates or updates a ConfigMap containing the inline
+// manifest content from the ImageBuild spec
+func (r *ImageBuildReconciler) createOrUpdateManifestConfigMap(
+	ctx context.Context,
+	imageBuild *automotivev1alpha1.ImageBuild,
+) (string, error) {
+	configMapName := safeDerivedName(imageBuild.Name, "-manifest")
+	manifestContent := imageBuild.Spec.GetManifest()
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      configMapName,
+			Namespace: imageBuild.Namespace,
+		},
+	}
+
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, cm, func() error {
+		cm.Labels = map[string]string{
+			"app.kubernetes.io/managed-by":                  "automotive-dev-operator",
+			"app.kubernetes.io/part-of":                     "automotive-dev",
+			"automotive.sdv.cloud.redhat.com/build-name":    imageBuild.Name,
+			"automotive.sdv.cloud.redhat.com/resource-type": "manifest",
+		}
+		manifestKey := imageBuild.Spec.GetManifestFileName()
+		if manifestKey == "" {
+			manifestKey = "manifest.aib.yml"
+		}
+		cm.Data = map[string]string{
+			manifestKey: manifestContent,
+		}
+
+		if customDefs := imageBuild.Spec.GetCustomDefs(); len(customDefs) > 0 {
+			cm.Data["custom-definitions.env"] = strings.Join(customDefs, "\n")
+		}
+		if extraArgs := imageBuild.Spec.GetAIBExtraArgs(); len(extraArgs) > 0 {
+			cm.Data["aib-extra-args.txt"] = strings.Join(extraArgs, "\n")
+		}
+
+		return controllerutil.SetControllerReference(imageBuild, cm, r.Scheme)
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create or update manifest ConfigMap %q: %w", configMapName, err)
+	}
+
+	return configMapName, nil
+}
+
 func (r *ImageBuildReconciler) createPushTaskRun(ctx context.Context, imageBuild *automotivev1alpha1.ImageBuild, artifactFilename string) error {
 	log := r.Log.WithValues("imagebuild", types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace})
 	log.Info("Creating push TaskRun for ImageBuild", "artifactFilename", artifactFilename)
@@ -683,7 +933,9 @@ func (r *ImageBuildReconciler) createPushTaskRun(ctx context.Context, imageBuild
 		return fmt.Errorf("artifact filename is required for push")
 	}
 
-	pushTask := tasks.GeneratePushArtifactRegistryTask(OperatorNamespace)
+	// Fetch OperatorConfig to resolve image overrides for the push task
+	pushBuildConfig := r.resolveBuildConfig(ctx)
+	pushTask := tasks.GeneratePushArtifactRegistryTask(OperatorNamespace, pushBuildConfig)
 
 	params := []tektonv1.Param{
 		{
@@ -748,7 +1000,7 @@ func (r *ImageBuildReconciler) createPushTaskRun(ctx context.Context, imageBuild
 
 	taskRun := &tektonv1.TaskRun{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: fmt.Sprintf("%s-push-", imageBuild.Name),
+			GenerateName: safeDerivedName(imageBuild.Name, "-push-"),
 			Namespace:    imageBuild.Namespace,
 			Labels: map[string]string{
 				tektonv1.ManagedByLabelKey:                        "automotive-dev-operator",
@@ -946,7 +1198,7 @@ func (r *ImageBuildReconciler) handleFlashingState(
 		fresh.Status.Message = "Build, push, and flash completed successfully"
 	} else {
 		fresh.Status.Phase = phaseFailed
-		fresh.Status.Message = "Flash to device failed"
+		fresh.Status.Message = taskRunFailureMessage(taskRun, "Flash to device failed")
 	}
 
 	if fresh.Status.CompletionTime == nil {
@@ -1007,7 +1259,11 @@ func (r *ImageBuildReconciler) createFlashTaskRun(
 		return fmt.Errorf("flash client config secret reference is required but not set")
 	}
 
-	flashTask := tasks.GenerateFlashTask(OperatorNamespace)
+	flashBuildConfig := &tasks.BuildConfig{
+		FlashTimeoutMinutes:  operatorConfig.Spec.OSBuilds.GetFlashTimeoutMinutes(),
+		DefaultLeaseDuration: operatorConfig.Spec.Jumpstarter.GetDefaultLeaseDuration(),
+	}
+	flashTask := tasks.GenerateFlashTask(OperatorNamespace, flashBuildConfig)
 
 	params := []tektonv1.Param{
 		{
@@ -1039,7 +1295,7 @@ func (r *ImageBuildReconciler) createFlashTaskRun(
 
 	taskRun := &tektonv1.TaskRun{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: fmt.Sprintf("%s-flash-", imageBuild.Name),
+			GenerateName: safeDerivedName(imageBuild.Name, "-flash-"),
 			Namespace:    imageBuild.Namespace,
 			Labels: map[string]string{
 				tektonv1.ManagedByLabelKey:                        "automotive-dev-operator",
@@ -1170,20 +1426,38 @@ func isPipelineRunSuccessful(pipelineRun *tektonv1.PipelineRun) bool {
 	}
 
 	for _, condition := range conditions {
-		if condition.Type == "Succeeded" {
+		if condition.Type == conditionSucceeded {
 			return condition.Status == "True"
 		}
 	}
 	return false
 }
 
+func pipelineRunFailureMessage(pipelineRun *tektonv1.PipelineRun) string {
+	for _, condition := range pipelineRun.Status.Conditions {
+		if condition.Type == conditionSucceeded && condition.Status != "True" && condition.Message != "" {
+			return fmt.Sprintf("Build failed: %s", condition.Message)
+		}
+	}
+	return "Build failed"
+}
+
+func taskRunFailureMessage(taskRun *tektonv1.TaskRun, fallback string) string {
+	for _, condition := range taskRun.Status.Conditions {
+		if condition.Type == conditionSucceeded && condition.Status != corev1.ConditionTrue && condition.Message != "" {
+			return fmt.Sprintf("%s: %s", fallback, condition.Message)
+		}
+	}
+	return fallback
+}
+
 // extractProvenance extracts build provenance information from PipelineRun results
 func extractProvenance(pipelineRun *tektonv1.PipelineRun, aibImage string) (aibImageUsed, builderImageUsed string) {
 	aibImageUsed = aibImage // Always record the AIB image that was requested
 
-	// Extract builder image from prepare-builder task result
+	// Extract builder image from pipeline result (written by build-image task)
 	for _, result := range pipelineRun.Status.Results {
-		if result.Name == "builder-image-ref" {
+		if result.Name == "builder-image" {
 			builderImageUsed = result.Value.StringVal
 			break
 		}
@@ -1224,7 +1498,7 @@ func isTaskRunSuccessful(taskRun *tektonv1.TaskRun) bool {
 func (r *ImageBuildReconciler) createUploadPod(ctx context.Context, imageBuild *automotivev1alpha1.ImageBuild) error {
 	log := r.Log.WithValues("imagebuild", types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace})
 
-	podName := fmt.Sprintf("%s-upload-pod", imageBuild.Name)
+	podName := safeDerivedName(imageBuild.Name, "-upload-pod")
 	existingPod := &corev1.Pod{}
 	err := r.Get(ctx, types.NamespacedName{
 		Name:      podName,
@@ -1333,6 +1607,29 @@ func (r *ImageBuildReconciler) createUploadPod(ctx context.Context, imageBuild *
 	return nil
 }
 
+// resolveBuildConfig fetches OperatorConfig and returns a BuildConfig for task generation.
+// Returns a minimal BuildConfig with defaults if OperatorConfig is unavailable.
+func (r *ImageBuildReconciler) resolveBuildConfig(ctx context.Context) *tasks.BuildConfig {
+	operatorConfig := &automotivev1alpha1.OperatorConfig{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "config", Namespace: OperatorNamespace}, operatorConfig); err != nil {
+		return &tasks.BuildConfig{}
+	}
+	bc := &tasks.BuildConfig{
+		AutomotiveImageBuilderImage: operatorConfig.Spec.GetImages().GetAutomotiveImageBuilderImage(),
+		YQHelperImage:               operatorConfig.Spec.GetImages().GetYQHelperImage(),
+		DefaultLeaseDuration:        operatorConfig.Spec.Jumpstarter.GetDefaultLeaseDuration(),
+	}
+	if operatorConfig.Spec.OSBuilds != nil {
+		bc.UseMemoryVolumes = operatorConfig.Spec.OSBuilds.UseMemoryVolumes
+		bc.MemoryVolumeSize = operatorConfig.Spec.OSBuilds.MemoryVolumeSize
+		bc.PVCSize = operatorConfig.Spec.OSBuilds.PVCSize
+		bc.RuntimeClassName = operatorConfig.Spec.OSBuilds.RuntimeClassName
+		bc.BuildTimeoutMinutes = operatorConfig.Spec.OSBuilds.GetBuildTimeoutMinutes()
+		bc.FlashTimeoutMinutes = operatorConfig.Spec.OSBuilds.GetFlashTimeoutMinutes()
+	}
+	return bc
+}
+
 func (r *ImageBuildReconciler) updateStatus(
 	ctx context.Context,
 	imageBuild *automotivev1alpha1.ImageBuild,
@@ -1395,7 +1692,7 @@ func (r *ImageBuildReconciler) getOrCreateWorkspacePVC(
 	}
 
 	timestamp := fmt.Sprintf("%d", time.Now().Unix())
-	uniquePVCName := fmt.Sprintf("%s-ws-%s", imageBuild.Name, timestamp)
+	uniquePVCName := safeDerivedName(fmt.Sprintf("%s-%s", imageBuild.Name, timestamp), "-ws")
 
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1443,7 +1740,7 @@ func (r *ImageBuildReconciler) getOrCreateWorkspacePVC(
 func (r *ImageBuildReconciler) shutdownUploadPod(ctx context.Context, imageBuild *automotivev1alpha1.ImageBuild) error {
 	log := r.Log.WithValues("imagebuild", types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace})
 
-	podName := fmt.Sprintf("%s-upload-pod", imageBuild.Name)
+	podName := safeDerivedName(imageBuild.Name, "-upload-pod")
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,

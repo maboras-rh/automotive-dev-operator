@@ -48,7 +48,7 @@ If you want more control over the test environment:
 
 5. **Wait for the operator to be ready:**
    ```bash
-   kubectl wait --for=condition=available --timeout=5m deployment/ado-controller-manager -n automotive-dev-operator-system
+   kubectl wait --for=condition=available --timeout=5m deployment/ado-operator -n automotive-dev-operator-system
    ```
 
 6. **Run the tests:**
@@ -106,7 +106,7 @@ If tests fail, check:
 
 1. **Controller logs:**
    ```bash
-   kubectl logs -n automotive-dev-operator-system -l control-plane=controller-manager
+   kubectl logs -n automotive-dev-operator-system -l control-plane=operator
    ```
 
 2. **Pod status:**

@@ -18,7 +18,7 @@ spec:
         app.kubernetes.io/name: automotive-dev-operator
         app.kubernetes.io/component: build-api
     spec:
-      serviceAccountName: ado-controller-manager
+      serviceAccountName: ado-operator
       initContainers:
       - name: init-secrets
         image: quay.io/rh-sdv-cloud/automotive-dev-operator:latest
@@ -61,7 +61,7 @@ spec:
         - --https-address=
         - --http-address=:8081
         - --upstream=http://localhost:8080
-        - --openshift-service-account=ado-controller-manager
+        - --openshift-service-account=ado-operator
         - --cookie-secret=$(COOKIE_SECRET)
         - --cookie-secure=false
         - --pass-access-token=true

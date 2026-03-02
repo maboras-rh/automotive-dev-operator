@@ -1,7 +1,7 @@
 apiVersion: operators.coreos.com/v1alpha1
 kind: CatalogSource
 metadata:
-  name: automotive-dev-operator-catalog
+  name: ${CATALOG_NAME}
   namespace: openshift-marketplace
 spec:
   sourceType: grpc

@@ -19,8 +19,11 @@ package operatorconfig
 import (
 	"testing"
 
+	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
 	. "github.com/onsi/ginkgo/v2" //nolint:revive
 	. "github.com/onsi/gomega"    //nolint:revive
+	"gopkg.in/yaml.v3"
+	corev1 "k8s.io/api/core/v1"
 )
 
 func TestResources(t *testing.T) {
@@ -28,11 +31,180 @@ func TestResources(t *testing.T) {
 	RunSpecs(t, "OperatorConfig Resources Suite")
 }
 
+func defaultTestConfig() *automotivev1alpha1.OperatorConfig {
+	return &automotivev1alpha1.OperatorConfig{
+		Spec: automotivev1alpha1.OperatorConfigSpec{
+			OSBuilds: &automotivev1alpha1.OSBuildsConfig{Enabled: true},
+		},
+	}
+}
+
 var _ = Describe("OperatorConfig Resources", func() {
-	// Tests for resource generation functions that are still in use
-	// (e.g. buildInternalJWTSecret, etc.)
-	// ConfigMap-related functions have been removed as we now read directly from OperatorConfig CRD
-	It("placeholder test", func() {
-		Expect(true).To(BeTrue())
+	var r *OperatorConfigReconciler
+
+	BeforeEach(func() {
+		r = &OperatorConfigReconciler{}
+	})
+
+	Describe("buildBuildAPIDeployment", func() {
+		It("should use ado-operator service account", func() {
+			deployment := r.buildBuildAPIDeployment("test-namespace", false, defaultTestConfig())
+			Expect(deployment.Spec.Template.Spec.ServiceAccountName).To(Equal("ado-operator"))
+		})
+
+		It("should use ado-operator service account on OpenShift", func() {
+			deployment := r.buildBuildAPIDeployment("test-namespace", true, defaultTestConfig())
+			Expect(deployment.Spec.Template.Spec.ServiceAccountName).To(Equal("ado-operator"))
+		})
+	})
+
+	Describe("buildBuildAPIContainers", func() {
+		It("should not include oauth-proxy on non-OpenShift", func() {
+			containers := r.buildBuildAPIContainers("test-namespace", false, defaultTestConfig())
+			Expect(containers).To(HaveLen(1))
+			Expect(containers[0].Name).To(Equal("build-api"))
+		})
+
+		It("should include oauth-proxy on OpenShift with ado-operator SA", func() {
+			containers := r.buildBuildAPIContainers("test-namespace", true, defaultTestConfig())
+			Expect(containers).To(HaveLen(2))
+
+			oauthProxy := containers[1]
+			Expect(oauthProxy.Name).To(Equal("oauth-proxy"))
+			Expect(oauthProxy.Args).To(ContainElement("--openshift-service-account=ado-operator"))
+		})
+
+		It("should not reference ado-controller-manager in oauth-proxy args", func() {
+			containers := r.buildBuildAPIContainers("test-namespace", true, defaultTestConfig())
+			for _, arg := range containers[1].Args {
+				Expect(arg).NotTo(ContainSubstring("controller-manager"))
+			}
+		})
+
+		It("should set BUILD_API_NAMESPACE environment variable to provided namespace", func() {
+			testNamespace := "custom-test-namespace"
+			containers := r.buildBuildAPIContainers(testNamespace, false, defaultTestConfig())
+
+			buildAPIContainer := containers[0]
+			var foundBuildAPINamespace bool
+			for _, envVar := range buildAPIContainer.Env {
+				if envVar.Name == "BUILD_API_NAMESPACE" {
+					foundBuildAPINamespace = true
+					Expect(envVar.Value).To(Equal(testNamespace))
+					Expect(envVar.ValueFrom).To(BeNil(), "should use direct value, not field reference")
+					break
+				}
+			}
+			Expect(foundBuildAPINamespace).To(BeTrue(), "BUILD_API_NAMESPACE environment variable should be present")
+		})
+
+		It("should have health check probes configured for build-api container", func() {
+			containers := r.buildBuildAPIContainers("test-namespace", false, defaultTestConfig())
+			buildAPIContainer := containers[0]
+
+			// Check liveness probe
+			Expect(buildAPIContainer.LivenessProbe).NotTo(BeNil())
+			Expect(buildAPIContainer.LivenessProbe.HTTPGet).NotTo(BeNil())
+			Expect(buildAPIContainer.LivenessProbe.HTTPGet.Path).To(Equal("/v1/healthz"))
+			Expect(buildAPIContainer.LivenessProbe.HTTPGet.Port.IntVal).To(Equal(int32(8080)))
+
+			// Check readiness probe
+			Expect(buildAPIContainer.ReadinessProbe).NotTo(BeNil())
+			Expect(buildAPIContainer.ReadinessProbe.HTTPGet).NotTo(BeNil())
+			Expect(buildAPIContainer.ReadinessProbe.HTTPGet.Path).To(Equal("/v1/healthz"))
+			Expect(buildAPIContainer.ReadinessProbe.HTTPGet.Port.IntVal).To(Equal(int32(8080)))
+
+			// Check startup probe
+			Expect(buildAPIContainer.StartupProbe).NotTo(BeNil())
+			Expect(buildAPIContainer.StartupProbe.HTTPGet).NotTo(BeNil())
+			Expect(buildAPIContainer.StartupProbe.HTTPGet.Path).To(Equal("/v1/healthz"))
+			Expect(buildAPIContainer.StartupProbe.HTTPGet.Port.IntVal).To(Equal(int32(8080)))
+			Expect(buildAPIContainer.StartupProbe.FailureThreshold).To(Equal(int32(30))) // 150s startup window
+		})
+	})
+
+	Describe("targetDefaultsYAML", func() {
+		It("should be valid YAML", func() {
+			var parsed map[string]interface{}
+			err := yaml.Unmarshal([]byte(targetDefaultsYAML), &parsed)
+			Expect(err).NotTo(HaveOccurred(), "targetDefaultsYAML should be valid YAML")
+		})
+
+		It("should have a targets key with entries", func() {
+			var parsed struct {
+				Targets map[string]struct {
+					Architecture string   `yaml:"architecture"`
+					ExtraArgs    []string `yaml:"extraArgs"`
+					Include      []string `yaml:"include"`
+				} `yaml:"targets"`
+			}
+			err := yaml.Unmarshal([]byte(targetDefaultsYAML), &parsed)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(parsed.Targets).NotTo(BeEmpty(), "should have at least one target")
+		})
+
+		It("should have a valid architecture for every target", func() {
+			var parsed struct {
+				Targets map[string]struct {
+					Architecture string `yaml:"architecture"`
+				} `yaml:"targets"`
+			}
+			Expect(yaml.Unmarshal([]byte(targetDefaultsYAML), &parsed)).To(Succeed())
+
+			validArchitectures := map[string]bool{"arm64": true, "amd64": true}
+			for name, t := range parsed.Targets {
+				Expect(t.Architecture).NotTo(BeEmpty(), "target %q should have an architecture", name)
+				Expect(validArchitectures).To(HaveKey(t.Architecture),
+					"target %q has unexpected architecture %q", name, t.Architecture)
+			}
+		})
+	})
+
+	Describe("buildBuildControllerDeployment", func() {
+		It("should use ado-build-controller service account", func() {
+			deployment := r.buildBuildControllerDeployment("test-namespace", defaultTestConfig())
+			Expect(deployment.Spec.Template.Spec.ServiceAccountName).To(Equal("ado-build-controller"))
+		})
+
+		It("should run in build mode", func() {
+			deployment := r.buildBuildControllerDeployment("test-namespace", defaultTestConfig())
+			container := deployment.Spec.Template.Spec.Containers[0]
+			Expect(container.Args).To(ContainElement("--mode=build"))
+		})
+
+		It("should set pod-level RunAsNonRoot", func() {
+			deployment := r.buildBuildControllerDeployment("test-namespace", defaultTestConfig())
+			podSec := deployment.Spec.Template.Spec.SecurityContext
+			Expect(podSec).NotTo(BeNil())
+			Expect(podSec.RunAsNonRoot).NotTo(BeNil())
+			Expect(*podSec.RunAsNonRoot).To(BeTrue())
+		})
+
+		It("should drop all capabilities and disallow privilege escalation", func() {
+			deployment := r.buildBuildControllerDeployment("test-namespace", defaultTestConfig())
+			container := deployment.Spec.Template.Spec.Containers[0]
+			sec := container.SecurityContext
+			Expect(sec).NotTo(BeNil())
+			Expect(sec.AllowPrivilegeEscalation).NotTo(BeNil())
+			Expect(*sec.AllowPrivilegeEscalation).To(BeFalse())
+			Expect(sec.Capabilities).NotTo(BeNil())
+			Expect(sec.Capabilities.Drop).To(ContainElement(corev1.Capability("ALL")))
+		})
+
+		It("should set WATCH_NAMESPACE environment variable to provided namespace", func() {
+			testNamespace := "custom-test-namespace"
+			deployment := r.buildBuildControllerDeployment(testNamespace, defaultTestConfig())
+			container := deployment.Spec.Template.Spec.Containers[0]
+
+			var foundWatchNamespace bool
+			for _, envVar := range container.Env {
+				if envVar.Name == "WATCH_NAMESPACE" {
+					foundWatchNamespace = true
+					Expect(envVar.Value).To(Equal(testNamespace))
+					break
+				}
+			}
+			Expect(foundWatchNamespace).To(BeTrue(), "WATCH_NAMESPACE environment variable should be present")
+		})
 	})
 })

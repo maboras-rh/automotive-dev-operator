@@ -1,5 +1,80 @@
-#!/bin/sh
-set -e
+# NOTE: common.sh is prepended to this script at embed time.
+
+ORAS_VERSION="1.2.0"
+# Detect container architecture
+case "$(uname -m)" in
+  x86_64) ORAS_ARCH="amd64" ;;
+  aarch64|arm64) ORAS_ARCH="arm64" ;;
+  *)
+    echo "ERROR: Unsupported architecture: $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+ORAS_TARBALL="oras_${ORAS_VERSION}_linux_${ORAS_ARCH}.tar.gz"
+ORAS_BASE_URL="https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}"
+ORAS_CHECKSUMS="oras_${ORAS_VERSION}_checksums.txt"
+
+cleanup_oras_files() {
+  rm -f "$ORAS_TARBALL" "$ORAS_CHECKSUMS" oras
+}
+
+trap cleanup_oras_files EXIT
+
+echo "Downloading ORAS ${ORAS_VERSION} with integrity verification..."
+
+curl -LO "${ORAS_BASE_URL}/${ORAS_TARBALL}" || {
+  echo "ERROR: Failed to download ORAS tarball" >&2
+  exit 1
+}
+
+curl -LO "${ORAS_BASE_URL}/${ORAS_CHECKSUMS}" || {
+  echo "ERROR: Failed to download ORAS checksums" >&2
+  exit 1
+}
+
+expected_checksum=$(grep "${ORAS_TARBALL}" "${ORAS_CHECKSUMS}" | cut -d' ' -f1)
+if [ -z "$expected_checksum" ]; then
+  echo "ERROR: Could not find checksum for ${ORAS_TARBALL} in checksums file" >&2
+  exit 1
+fi
+
+if command -v sha256sum >/dev/null; then
+  actual_checksum=$(sha256sum "${ORAS_TARBALL}" | cut -d' ' -f1)
+elif command -v shasum >/dev/null; then
+  actual_checksum=$(shasum -a 256 "${ORAS_TARBALL}" | cut -d' ' -f1)
+else
+  echo "ERROR: Neither sha256sum nor shasum available for checksum verification" >&2
+  exit 1
+fi
+
+if [ "$expected_checksum" != "$actual_checksum" ]; then
+  echo "ERROR: Checksum verification failed for ${ORAS_TARBALL}" >&2
+  echo "  Expected: $expected_checksum" >&2
+  echo "  Actual:   $actual_checksum" >&2
+  exit 1
+fi
+
+echo "Checksum verification passed: $expected_checksum"
+
+tar -zxf "$ORAS_TARBALL" oras || {
+  echo "ERROR: Failed to extract ORAS from tarball" >&2
+  exit 1
+}
+
+mkdir -p "$HOME/bin"
+mv oras "$HOME/bin/" || {
+  echo "ERROR: Failed to install ORAS binary" >&2
+  exit 1
+}
+
+if ! echo "$PATH" | grep -q "$HOME/bin"; then
+  export PATH="$HOME/bin:$PATH"
+fi
+
+cleanup_oras_files
+trap - EXIT
+
+echo "ORAS ${ORAS_VERSION} installed successfully"
 
 # Get media type based on file format and compression
 get_media_type() {
@@ -52,6 +127,26 @@ get_partition_name() {
   basename "$1" | sed -E 's/\.(simg|raw|img)(\.tar)?(\.(gz|lz4|xz))?$//'
 }
 
+# Remap partition names for specific targets where AIB's logical names
+# don't match the physical partition layout on the device.
+# Args: $1 = partition name, $2 = target
+remap_partition_for_target() {
+  part_name="$1"
+  target_name="$2"
+
+  # ride4* and ridesx4* targets use system_b for qm_var content
+  case "$target_name" in
+    ride4*|ridesx4*)
+      case "$part_name" in
+        qm_var) echo "system_b" ; return ;;
+      esac
+      ;;
+  esac
+
+  echo "$part_name"
+}
+
+
 # Get decompressed file size from sidecar .size file (created by build_image.sh)
 # Falls back to empty string if sidecar doesn't exist
 get_decompressed_size() {
@@ -77,6 +172,36 @@ parts_dir="${exportFile}-parts"
 distro="$(params.distro)"
 target="$(params.target)"
 arch="$(params.arch)"
+builder_image_used="$(params.builder-image)"
+
+config_file="/etc/target-defaults/target-defaults.yaml"
+default_partitions=""
+if [ -f "$config_file" ]; then
+  # Use yq to extract included partitions for target (using bracket notation for safety)
+  default_partitions=$(yq eval ".targets[\"${target}\"].include[]" "$config_file" 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+
+  if [ -n "$default_partitions" ]; then
+    echo "Default partitions for target '$target': $default_partitions"
+  else
+    echo "No default partitions configured for target '$target', skipping default-partitions annotation"
+  fi
+else
+  echo "No partition configuration found, skipping default-partitions annotation"
+fi
+
+default_partitions_annotation=""
+if [ -n "$default_partitions" ]; then
+  default_partitions_escaped=$(json_escape "$default_partitions")
+  default_partitions_annotation=",
+    \"automotive.sdv.cloud.redhat.com/default-partitions\": \"${default_partitions_escaped}\""
+fi
+
+builder_image_annotation=""
+if [ -n "$builder_image_used" ]; then
+  builder_image_escaped=$(json_escape "$builder_image_used")
+  builder_image_annotation=",
+    \"automotive.sdv.cloud.redhat.com/builder-image\": \"${builder_image_escaped}\""
+fi
 
 cd /workspace/shared
 
@@ -91,6 +216,21 @@ echo ""
 if [ -d "${parts_dir}" ] && [ -n "$(ls -A "${parts_dir}" 2>/dev/null)" ]; then
   echo "Found parts directory: ${parts_dir}"
   echo "Using multi-layer push for individual partition files"
+
+  # For ride4/ridesx4 targets, duplicate boot_a as boot_b so both partitions get flashed
+  case "$target" in
+    ride4*|ridesx4*)
+      for boot_a_file in "${parts_dir}"/boot_a.*; do
+        [ -f "$boot_a_file" ] || continue
+        boot_b_file=$(echo "$boot_a_file" | sed 's/boot_a/boot_b/')
+        if [ ! -f "$boot_b_file" ]; then
+          echo "Duplicating $(basename "$boot_a_file") as $(basename "$boot_b_file") for target $target"
+          cp "$boot_a_file" "$boot_b_file"
+        fi
+      done
+      ;;
+  esac
+
   ls -la "${parts_dir}/"
 
   cd "${parts_dir}"
@@ -111,8 +251,10 @@ if [ -d "${parts_dir}" ] && [ -n "$(ls -A "${parts_dir}" 2>/dev/null)" ]; then
     if [ -f "$part_file" ]; then
       filename="$part_file"
       part_media_type=$(get_media_type "$filename")
-      partition_name=$(get_partition_name "$filename")
+      raw_partition_name=$(get_partition_name "$filename")
+      partition_name=$(remap_partition_for_target "$raw_partition_name" "$target")
       decompressed_size=$(get_decompressed_size "$filename")
+
 
       echo "  Layer: ${filename} (partition: ${partition_name}, type: ${part_media_type}, decompressed: ${decompressed_size:-unknown})"
 
@@ -132,7 +274,6 @@ if [ -d "${parts_dir}" ] && [ -n "$(ls -A "${parts_dir}" 2>/dev/null)" ]; then
         layer_annotations_json="${layer_annotations_json},"
       fi
 
-      # Safely escape values for JSON
       escaped_filename=$(json_escape "$filename")
       escaped_partition=$(json_escape "$partition_name")
       escaped_decompressed_size=$(json_escape "$decompressed_size")
@@ -146,7 +287,6 @@ if [ -d "${parts_dir}" ] && [ -n "$(ls -A "${parts_dir}" 2>/dev/null)" ]; then
     fi
   done
 
-  # Guard: fail fast if no partition files were found
   if [ -z "$file_list" ]; then
     echo "ERROR: No partition files found in ${parts_dir}" >&2
     echo "  Expected .simg, .raw, or .img files but directory appears empty or contains no regular files" >&2
@@ -154,7 +294,7 @@ if [ -d "${parts_dir}" ] && [ -n "$(ls -A "${parts_dir}" 2>/dev/null)" ]; then
     exit 1
   fi
 
-  # Get artifact type from first entry in filtered file_list (avoids sidecar .size files)
+  # Get artifact type from first entry in filtered file_list
   first_filename=$(echo "$file_list" | cut -d',' -f1)
   artifact_type=$(get_artifact_type "$first_filename")
 
@@ -165,11 +305,13 @@ if [ -d "${parts_dir}" ] && [ -n "$(ls -A "${parts_dir}" 2>/dev/null)" ]; then
     "automotive.sdv.cloud.redhat.com/parts": "${file_list}",
     "automotive.sdv.cloud.redhat.com/distro": "${distro}",
     "automotive.sdv.cloud.redhat.com/target": "${target}",
-    "automotive.sdv.cloud.redhat.com/arch": "${arch}"
+    "automotive.sdv.cloud.redhat.com/arch": "${arch}"${default_partitions_annotation}${builder_image_annotation}
   },
   ${layer_annotations_json}
 }
 EOF
+
+  emit_progress "Pushing artifact" 0 1
 
   echo ""
   echo "Pushing multi-layer artifact to ${repo_url}"
@@ -181,7 +323,8 @@ EOF
   # Push with multi-layer manifest using annotation file
   # Files are pushed from current directory (parts_dir) so they extract flat
   # shellcheck disable=SC2086
-  oras push --disable-path-validation \
+  "$HOME/bin/oras" push --disable-path-validation \
+    --image-spec v1.1 \
     --artifact-type "${artifact_type}" \
     --annotation-file "$annotations_file" \
     "${repo_url}" \
@@ -190,16 +333,10 @@ EOF
   # Clean up annotation file (also handled by trap)
   rm -f "$annotations_file"
 
+  emit_progress "Pushing artifact" 1 1
+
   echo ""
   echo "=== Multi-layer artifact pushed successfully ==="
-  echo ""
-  echo "Files are stored flat (no subdirectory). After pull, you get:"
-  echo "$file_list" | sed 's/,/\n/g' | while read -r f; do echo "  ./$f"; done
-  echo ""
-  echo "Pull commands:"
-  echo "  All files:      oras pull ${repo_url}"
-  echo "  Single file:    oras pull ${repo_url} --include \"boot_a.simg.gz\""
-  echo "  Inspect:        oras manifest fetch ${repo_url} | jq ."
 
 else
   # Fallback to single-file push (original behavior)
@@ -222,12 +359,19 @@ else
     fi
   fi
 
+  if [ -n "$builder_image_used" ]; then
+    annotation_args="${annotation_args} --annotation automotive.sdv.cloud.redhat.com/builder-image=${builder_image_used}"
+  fi
+
+  emit_progress "Pushing artifact" 0 1
+
   echo "Pushing single-file artifact to ${repo_url}"
   echo "  File: ${exportFile}"
   echo "  Media type: ${media_type}"
   echo "  Annotations: distro=${distro}, target=${target}, arch=${arch}"
 
-  oras push --disable-path-validation \
+  "$HOME/bin/oras" push --disable-path-validation \
+    --image-spec v1.1 \
     --artifact-type "${media_type}" \
     --annotation "automotive.sdv.cloud.redhat.com/distro=${distro}" \
     --annotation "automotive.sdv.cloud.redhat.com/target=${target}" \
@@ -236,7 +380,8 @@ else
     "${repo_url}" \
     "${exportFile}:${media_type}"
 
+  emit_progress "Pushing artifact" 1 1
+
   echo ""
   echo "=== Artifact pushed successfully ==="
-  echo "Pull: oras pull ${repo_url}"
 fi

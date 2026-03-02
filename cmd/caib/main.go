@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -14,8 +15,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/containers/image/v5/copy"
@@ -26,17 +30,37 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/auth"
+	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/authcmd"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/catalog"
+	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/config"
+	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/container"
+	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/registryauth"
+	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/ui"
 	buildapitypes "github.com/centos-automotive-suite/automotive-dev-operator/internal/buildapi"
 	buildapiclient "github.com/centos-automotive-suite/automotive-dev-operator/internal/buildapi/client"
+	"github.com/fatih/color"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
 const (
-	archAMD64   = "amd64"
-	archARM64   = "arm64"
-	phaseFailed = "Failed"
+	archAMD64       = "amd64"
+	archARM64       = "arm64"
+	phaseCompleted  = "Completed"
+	phaseFailed     = "Failed"
+	phaseFlashing   = "Flashing"
+	phasePending    = "Pending"
+	phaseUploading  = "Uploading"
+	phaseRunning    = "Running"
+	errPrefixBuild  = "build"
+	errPrefixFlash  = "flash"
+	errPrefixPush   = "push"
+	defaultRegistry = "docker.io"
+)
+
+var (
+	multiHyphenRe = regexp.MustCompile(`-{2,}`)
 )
 
 // getDefaultArch returns the current system architecture in caib format
@@ -55,6 +79,7 @@ var (
 	serverURL              string
 	manifest               string
 	buildName              string
+	showOutputFormat       string
 	distro                 string
 	target                 string
 	architecture           string
@@ -72,13 +97,15 @@ var (
 	compressionAlgo        string
 	authToken              string
 
-	containerPush  string
-	buildDiskImage bool
-	diskFormat     string
-	exportOCI      string
-	builderImage   string
+	containerPush    string
+	buildDiskImage   bool
+	diskFormat       string
+	exportOCI        string
+	builderImage     string
+	registryAuthFile string
 
-	containerRef string
+	containerRef   string
+	rebuildBuilder bool
 
 	// Flash options
 	flashAfterBuild   bool
@@ -86,7 +113,65 @@ var (
 	flashName         string
 	exporterSelector  string
 	leaseDuration     string
+
+	// Internal registry options
+	useInternalRegistry       bool
+	internalRegistryImageName string
+	internalRegistryTag       string
+
+	// TLS options
+	insecureSkipTLS bool
+
+	// Sealed operation options
+	sealedBuilderImage      string
+	sealedArchitecture      string
+	sealedKeySecret         string
+	sealedKeyPasswordSecret string
+	sealedKeyFile           string
+	sealedKeyPassword       string
+	sealedInputRef          string
+	sealedOutputRef         string
+	sealedSignedRef         string
 )
+
+// envBool parses a boolean from environment variable
+func envBool(key string) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return false
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false
+	}
+	return b
+}
+
+func supportsColorOutput() bool {
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+
+	if !term.IsTerminal(int(os.Stdout.Fd())) {
+		return false
+	}
+
+	termType := os.Getenv("TERM")
+	if termType == "dumb" {
+		return false
+	}
+
+	shell := os.Getenv("SHELL")
+
+	isSupportedShell := strings.Contains(shell, "bash") ||
+		strings.Contains(shell, "fish") ||
+		strings.Contains(shell, "zsh")
+
+	hasColorTerm := termType != "" &&
+		!strings.Contains(termType, "mono")
+
+	return !color.NoColor || isSupportedShell || hasColorTerm
+}
 
 // createBuildAPIClient creates a build API client with authentication token from flags or kubeconfig
 // It will attempt OIDC re-authentication if token is missing or expired
@@ -97,7 +182,7 @@ func createBuildAPIClient(serverURL string, authToken *string) (*buildapiclient.
 
 	// If no explicit token, try OIDC if config is available
 	if !explicitToken {
-		token, didAuth, err := auth.GetTokenWithReauth(ctx, serverURL, "")
+		token, didAuth, err := auth.GetTokenWithReauth(ctx, serverURL, "", insecureSkipTLS)
 		if err != nil {
 			// OIDC is configured but failed - don't silently fall back to kubeconfig
 			// This indicates a real authentication failure that should be reported
@@ -138,6 +223,9 @@ func createBuildAPIClient(serverURL string, authToken *string) (*buildapiclient.
 	}
 
 	// Configure TLS
+	if insecureSkipTLS {
+		opts = append(opts, buildapiclient.WithInsecureTLS())
+	}
 	// Check for custom CA certificate
 	if caCertFile := os.Getenv("SSL_CERT_FILE"); caCertFile != "" {
 		opts = append(opts, buildapiclient.WithCACertificate(caCertFile))
@@ -169,7 +257,7 @@ func executeWithReauth(serverURL string, authToken *string, fn func(*buildapicli
 	// Auth error (401) - try re-authentication; token may be rejected, not necessarily expired
 	fmt.Println("Authentication failed (401), re-authenticating...")
 
-	newToken, _, err := auth.GetTokenWithReauth(ctx, serverURL, *authToken)
+	newToken, _, err := auth.GetTokenWithReauth(ctx, serverURL, *authToken, insecureSkipTLS)
 	if err != nil {
 		return fmt.Errorf("re-authentication failed: %w", err)
 	}
@@ -216,53 +304,36 @@ func executeWithReauth(serverURL string, authToken *string, fn func(*buildapicli
 	return err
 }
 
-// extractRegistryCredentials extracts registry URL and returns registry URL and credentials from env vars
-func extractRegistryCredentials(primaryRef, secondaryRef string) (string, string, string) {
-	// Get credentials from environment variables only
-	username := os.Getenv("REGISTRY_USERNAME")
-	password := os.Getenv("REGISTRY_PASSWORD")
-
-	// Determine the reference to use for URL extraction
-	ref := primaryRef
-	if ref == "" {
-		ref = secondaryRef
+// writeRegistryCredentialsFile writes registry credentials to a mode-0600 temp file and returns its path.
+func writeRegistryCredentialsFile(token string) (string, error) {
+	creds, err := json.Marshal(map[string]string{
+		"username": "serviceaccount",
+		"token":    token,
+	})
+	if err != nil {
+		return "", err
 	}
 
-	// If no reference, return empty
-	if ref == "" {
-		return "", username, password
+	f, err := os.CreateTemp("", "caib-registry-creds-*.json")
+	if err != nil {
+		return "", err
 	}
+	name := f.Name()
 
-	// Warn if credentials missing (will fall back to Docker/Podman auth files)
-	if username == "" || password == "" {
-		fmt.Println("Warning: No registry credentials provided via environment variables.")
-		fmt.Println("Will attempt to use Docker/Podman auth files as fallback.")
+	if _, err := f.Write(creds); err != nil {
+		_ = f.Close()
+		_ = os.Remove(name)
+		return "", err
 	}
-
-	// Extract registry URL from reference
-	parts := strings.SplitN(ref, "/", 2)
-	if len(parts) > 1 && (strings.Contains(parts[0], ".") || strings.Contains(parts[0], ":") || parts[0] == "localhost") {
-		return parts[0], username, password
+	if err := f.Close(); err != nil {
+		_ = os.Remove(name)
+		return "", err
 	}
-	return "docker.io", username, password
-}
-
-// validateRegistryCredentials validates registry credentials and returns an error for partial credentials
-func validateRegistryCredentials(registryURL, username, password string) error {
-	// If no registry URL, no credentials needed
-	if registryURL == "" {
-		return nil
+	if err := os.Chmod(name, 0600); err != nil {
+		_ = os.Remove(name)
+		return "", err
 	}
-
-	// Both username and password must be provided together, or neither
-	if (username == "") != (password == "") {
-		if username == "" {
-			return fmt.Errorf("REGISTRY_PASSWORD is set but REGISTRY_USERNAME is missing")
-		}
-		return fmt.Errorf("REGISTRY_USERNAME is set but REGISTRY_PASSWORD is missing")
-	}
-
-	return nil
+	return name, nil
 }
 
 func validateOutputRequiresPush(output, pushRef, flagName string) {
@@ -274,11 +345,11 @@ func validateOutputRequiresPush(output, pushRef, flagName string) {
 	}
 }
 
-func downloadOCIArtifactIfRequested(output, exportOCI, registryUsername, registryPassword string) {
+func downloadOCIArtifactIfRequested(output, exportOCI, registryUsername, registryPassword string, insecureSkipTLS bool) {
 	if output == "" {
 		return
 	}
-	if err := pullOCIArtifact(exportOCI, output, registryUsername, registryPassword); err != nil {
+	if err := pullOCIArtifact(exportOCI, output, registryUsername, registryPassword, insecureSkipTLS); err != nil {
 		handleError(fmt.Errorf("failed to download OCI artifact: %w", err))
 	}
 }
@@ -291,6 +362,14 @@ func main() {
 
 	rootCmd.InitDefaultVersionFlag()
 	rootCmd.SetVersionTemplate("caib version: {{.Version}}\n")
+
+	// Global flags
+	rootCmd.PersistentFlags().BoolVar(
+		&insecureSkipTLS,
+		"insecure",
+		envBool("CAIB_INSECURE"),
+		"skip TLS certificate verification (insecure, for testing only; env: CAIB_INSECURE)",
+	)
 
 	// Main build command (bootc - the default, future-focused approach)
 	buildCmd := &cobra.Command{
@@ -348,34 +427,6 @@ Examples:
 		Run:  runBuildDev,
 	}
 
-	// Deprecated aliases (hidden but functional for backwards compatibility)
-	buildBootcAliasCmd := &cobra.Command{
-		Use:        "build-bootc <manifest.aib.yml>",
-		Short:      "Build bootc container image (deprecated: use 'build' instead)",
-		Args:       cobra.ExactArgs(1),
-		Run:        runBuild,
-		Deprecated: "use 'build' instead (bootc is now the default)",
-		Hidden:     true,
-	}
-
-	buildLegacyAliasCmd := &cobra.Command{
-		Use:        "build-legacy <manifest.aib.yml>",
-		Short:      "Build disk image (deprecated: use 'build-dev' instead)",
-		Args:       cobra.ExactArgs(1),
-		Run:        runBuildDev,
-		Deprecated: "use 'build-dev' instead",
-		Hidden:     true,
-	}
-
-	buildTraditionalAliasCmd := &cobra.Command{
-		Use:        "build-traditional <manifest.aib.yml>",
-		Short:      "Build traditional disk image (deprecated: use 'build-dev' instead)",
-		Args:       cobra.ExactArgs(1),
-		Run:        runBuildDev,
-		Deprecated: "use 'build-dev' instead",
-		Hidden:     true,
-	}
-
 	// Flash command - flash a disk image to hardware via Jumpstarter
 	flashCmd := &cobra.Command{
 		Use:   "flash <oci-registry-reference>",
@@ -401,8 +452,74 @@ Examples:
 		Run:   runList,
 	}
 
+	showCmd := &cobra.Command{
+		Use:   "show <build-name>",
+		Short: "Show detailed information for an ImageBuild",
+		Long: `Show retrieves detailed status and output fields for a single ImageBuild.
+
+Examples:
+  # Show details in table format
+  caib show my-build
+
+  # Show details as JSON
+  caib show my-build -o json`,
+		Args: cobra.ExactArgs(1),
+		Run:  runShow,
+	}
+
+	downloadCmd := &cobra.Command{
+		Use:   "download <build-name>",
+		Short: "Download disk image artifact from a completed build",
+		Long: `Download retrieves the disk image artifact from a completed build.
+
+The build must have pushed a disk image to an OCI registry (via --push-disk
+or --push on disk/build-dev commands). The artifact is pulled from the
+registry to a local file.
+
+Examples:
+  # Download disk image from a completed build
+  caib download my-build -o ./disk.qcow2
+
+  # Download to a directory (multi-layer artifacts extract here)
+  caib download my-build -o ./output/`,
+		Args: cobra.ExactArgs(1),
+		Run:  runDownload,
+	}
+
+	logsCmd := &cobra.Command{
+		Use:   "logs <build-name>",
+		Short: "Follow logs of an existing build",
+		Long: `Follow the log output of an active or completed build.
+
+This is useful when you kicked off a build and need to reconnect later
+(e.g., after restarting your terminal or computer).
+
+Examples:
+  # Follow logs of an active build
+  caib logs my-build-20250101-120000
+
+  # List builds first, then follow one
+  caib list
+  caib logs <build-name>`,
+		Args: cobra.ExactArgs(1),
+		Run:  runLogs,
+	}
+
+	loginCmd := &cobra.Command{
+		Use:   "login [server-url]",
+		Short: "Save server endpoint and authenticate for subsequent commands",
+		Long: `Login saves the Build API server URL locally (~/.caib/cli.json) so you do not need
+to pass --server or set CAIB_SERVER for later commands. If the server uses OIDC,
+this command also performs authentication and caches the token.
+
+Example:
+  caib login https://build-api.my-cluster.example.com`,
+		Args: cobra.ExactArgs(1),
+		Run:  runLogin,
+	}
+
 	// build command flags (bootc - the default)
-	buildCmd.Flags().StringVar(&serverURL, "server", os.Getenv("CAIB_SERVER"), "REST API server base URL")
+	buildCmd.Flags().StringVar(&serverURL, "server", config.DefaultServer(), "REST API server base URL")
 	buildCmd.Flags().StringVar(&authToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
 	buildCmd.Flags().StringVarP(&buildName, "name", "n", "", "name for the ImageBuild (auto-generated if omitted)")
 	buildCmd.Flags().StringVarP(&distro, "distro", "d", "autosd", "distribution to build")
@@ -410,39 +527,60 @@ Examples:
 	buildCmd.Flags().StringVarP(&architecture, "arch", "a", getDefaultArch(), "architecture (amd64, arm64)")
 	buildCmd.Flags().StringVar(&containerPush, "push", "", "push bootc container to registry (optional if --disk is used)")
 	buildCmd.Flags().BoolVar(&buildDiskImage, "disk", false, "also build disk image from container")
-	buildCmd.Flags().StringVarP(&outputDir, "output", "o", "", "download disk image to file from registry (implies --disk; requires --push-disk)")
+	buildCmd.Flags().StringVarP(&outputDir, "output", "o", "", "download disk image to file from registry (implies --disk; requires --push-disk or --internal-registry)")
 	buildCmd.Flags().StringVar(
 		&diskFormat, "format", "", "disk image format (qcow2, raw, simg); inferred from output filename if not set",
 	)
 	buildCmd.Flags().StringVar(&compressionAlgo, "compress", "gzip", "compression algorithm (gzip, lz4, xz)")
-	buildCmd.Flags().StringVar(&exportOCI, "push-disk", "", "push disk image as OCI artifact to registry")
+	buildCmd.Flags().StringVar(&exportOCI, "push-disk", "", "push disk image as OCI artifact to registry (implies --disk)")
+	buildCmd.Flags().StringVar(
+		&registryAuthFile,
+		"registry-auth-file",
+		"",
+		"path to Docker/Podman auth file for push authentication (takes precedence over env vars and auto-discovery)",
+	)
 	buildCmd.Flags().StringVar(
 		&automotiveImageBuilder, "aib-image",
 		"quay.io/centos-sig-automotive/automotive-image-builder:latest", "AIB container image",
 	)
 	buildCmd.Flags().StringVar(&builderImage, "builder-image", "", "custom builder container")
+	buildCmd.Flags().BoolVar(&rebuildBuilder, "rebuild-builder", false, "force rebuild of the bootc builder image")
 	buildCmd.Flags().StringVar(&storageClass, "storage-class", "", "Kubernetes storage class for build workspace")
 	buildCmd.Flags().StringArrayVarP(&customDefs, "define", "D", []string{}, "custom definition KEY=VALUE")
 	buildCmd.Flags().StringArrayVar(&aibExtraArgs, "extra-args", []string{}, "extra arguments to pass to AIB (can be repeated)")
 	buildCmd.Flags().IntVar(&timeout, "timeout", 60, "timeout in minutes")
-	buildCmd.Flags().BoolVarP(&waitForBuild, "wait", "w", false, "wait for build to complete")
-	buildCmd.Flags().BoolVarP(&followLogs, "follow", "f", true, "follow build logs")
+	buildCmd.Flags().BoolVarP(&waitForBuild, "wait", "w", true, "wait for build to complete")
+	buildCmd.Flags().BoolVarP(&followLogs, "follow", "f", false, "follow build logs (shows full log output instead of progress bar)")
 	// Note: --push is optional when --disk is used (disk image becomes the output)
 	// Jumpstarter flash options
 	buildCmd.Flags().BoolVar(&flashAfterBuild, "flash", false, "flash the image to device after build completes")
 	buildCmd.Flags().StringVar(&jumpstarterClient, "client", "", "path to Jumpstarter client config file (required for --flash)")
 	buildCmd.Flags().StringVar(&leaseDuration, "lease", "03:00:00", "device lease duration for flash (HH:MM:SS)")
+	// Internal registry options
+	buildCmd.Flags().BoolVar(&useInternalRegistry, "internal-registry", false, "push to OpenShift internal registry")
+	buildCmd.Flags().StringVar(&internalRegistryImageName, "image-name", "", "override image name for internal registry (default: build name)")
+	buildCmd.Flags().StringVar(&internalRegistryTag, "image-tag", "", "tag for internal registry image (default: build name)")
 
 	listCmd.Flags().StringVar(
-		&serverURL, "server", os.Getenv("CAIB_SERVER"), "REST API server base URL (e.g. https://api.example)",
+		&serverURL, "server", config.DefaultServer(), "REST API server base URL (e.g. https://api.example)",
 	)
 	listCmd.Flags().StringVar(
 		&authToken, "token", os.Getenv("CAIB_TOKEN"),
 		"Bearer token for authentication (e.g., OpenShift access token)",
 	)
+	showCmd.Flags().StringVar(
+		&serverURL, "server", config.DefaultServer(), "REST API server base URL (e.g. https://api.example)",
+	)
+	showCmd.Flags().StringVar(
+		&authToken, "token", os.Getenv("CAIB_TOKEN"),
+		"Bearer token for authentication (e.g., OpenShift access token)",
+	)
+	showCmd.Flags().StringVarP(
+		&showOutputFormat, "output", "o", "table", "Output format (table, json, yaml)",
+	)
 
 	// disk command flags (create disk from existing container)
-	diskCmd.Flags().StringVar(&serverURL, "server", os.Getenv("CAIB_SERVER"), "REST API server base URL")
+	diskCmd.Flags().StringVar(&serverURL, "server", config.DefaultServer(), "REST API server base URL")
 	diskCmd.Flags().StringVar(&authToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
 	diskCmd.Flags().StringVarP(&buildName, "name", "n", "", "name for the build job (auto-generated if omitted)")
 	diskCmd.Flags().StringVarP(&outputDir, "output", "o", "", "download disk image to file from registry (requires --push)")
@@ -451,6 +589,12 @@ Examples:
 	)
 	diskCmd.Flags().StringVar(&compressionAlgo, "compress", "gzip", "compression algorithm (gzip, lz4, xz)")
 	diskCmd.Flags().StringVar(&exportOCI, "push", "", "push disk image as OCI artifact to registry")
+	diskCmd.Flags().StringVar(
+		&registryAuthFile,
+		"registry-auth-file",
+		"",
+		"path to Docker/Podman auth file for push authentication (takes precedence over env vars and auto-discovery)",
+	)
 	diskCmd.Flags().StringVarP(&distro, "distro", "d", "autosd", "distribution")
 	diskCmd.Flags().StringVarP(&target, "target", "t", "qemu", "target platform")
 	diskCmd.Flags().StringVarP(&architecture, "arch", "a", getDefaultArch(), "architecture (amd64, arm64)")
@@ -462,14 +606,18 @@ Examples:
 	diskCmd.Flags().StringArrayVar(&aibExtraArgs, "extra-args", []string{}, "extra arguments to pass to AIB (can be repeated)")
 	diskCmd.Flags().IntVar(&timeout, "timeout", 60, "timeout in minutes")
 	diskCmd.Flags().BoolVarP(&waitForBuild, "wait", "w", false, "wait for build to complete")
-	diskCmd.Flags().BoolVarP(&followLogs, "follow", "f", true, "follow build logs")
+	diskCmd.Flags().BoolVarP(&followLogs, "follow", "f", false, "follow build logs (shows full log output instead of progress bar)")
 	// Jumpstarter flash options
 	diskCmd.Flags().BoolVar(&flashAfterBuild, "flash", false, "flash the image to device after build completes")
 	diskCmd.Flags().StringVar(&jumpstarterClient, "client", "", "path to Jumpstarter client config file (required for --flash)")
 	diskCmd.Flags().StringVar(&leaseDuration, "lease", "03:00:00", "device lease duration for flash (HH:MM:SS)")
+	// Internal registry options
+	diskCmd.Flags().BoolVar(&useInternalRegistry, "internal-registry", false, "push to OpenShift internal registry")
+	diskCmd.Flags().StringVar(&internalRegistryImageName, "image-name", "", "override image name for internal registry (default: build name)")
+	diskCmd.Flags().StringVar(&internalRegistryTag, "image-tag", "", "tag for internal registry image (default: build name)")
 
 	// build-dev command flags (traditional ostree/package builds)
-	buildDevCmd.Flags().StringVar(&serverURL, "server", os.Getenv("CAIB_SERVER"), "REST API server base URL")
+	buildDevCmd.Flags().StringVar(&serverURL, "server", config.DefaultServer(), "REST API server base URL")
 	buildDevCmd.Flags().StringVar(&authToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
 	buildDevCmd.Flags().StringVarP(&buildName, "name", "n", "", "name for the ImageBuild")
 	buildDevCmd.Flags().StringVarP(&distro, "distro", "d", "autosd", "distribution to build")
@@ -481,6 +629,12 @@ Examples:
 	buildDevCmd.Flags().StringVar(&compressionAlgo, "compress", "gzip", "compression algorithm (gzip, lz4, xz)")
 	buildDevCmd.Flags().StringVar(&exportOCI, "push", "", "push disk image as OCI artifact to registry")
 	buildDevCmd.Flags().StringVar(
+		&registryAuthFile,
+		"registry-auth-file",
+		"",
+		"path to Docker/Podman auth file for push authentication (takes precedence over env vars and auto-discovery)",
+	)
+	buildDevCmd.Flags().StringVar(
 		&automotiveImageBuilder, "aib-image",
 		"quay.io/centos-sig-automotive/automotive-image-builder:latest", "AIB container image",
 	)
@@ -489,28 +643,124 @@ Examples:
 	buildDevCmd.Flags().StringArrayVar(&aibExtraArgs, "extra-args", []string{}, "extra arguments to pass to AIB (can be repeated)")
 	buildDevCmd.Flags().IntVar(&timeout, "timeout", 60, "timeout in minutes")
 	buildDevCmd.Flags().BoolVarP(&waitForBuild, "wait", "w", false, "wait for build to complete")
-	buildDevCmd.Flags().BoolVarP(&followLogs, "follow", "f", true, "follow build logs")
+	buildDevCmd.Flags().BoolVarP(&followLogs, "follow", "f", false, "follow build logs (shows full log output instead of progress bar)")
 	// Jumpstarter flash options
 	buildDevCmd.Flags().BoolVar(&flashAfterBuild, "flash", false, "flash the image to device after build completes")
 	buildDevCmd.Flags().StringVar(&jumpstarterClient, "client", "", "path to Jumpstarter client config file (required for --flash)")
 	buildDevCmd.Flags().StringVar(&leaseDuration, "lease", "03:00:00", "device lease duration for flash (HH:MM:SS)")
+	// Internal registry options
+	buildDevCmd.Flags().BoolVar(&useInternalRegistry, "internal-registry", false, "push to OpenShift internal registry")
+	buildDevCmd.Flags().StringVar(&internalRegistryImageName, "image-name", "", "override image name for internal registry (default: build name)")
+	buildDevCmd.Flags().StringVar(&internalRegistryTag, "image-tag", "", "tag for internal registry image (default: build name)")
+
+	// logs command flags
+	logsCmd.Flags().StringVar(&serverURL, "server", config.DefaultServer(), "REST API server base URL")
+	logsCmd.Flags().StringVar(&authToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
+	logsCmd.Flags().IntVar(&timeout, "timeout", 60, "timeout in minutes")
+
+	// download command flags
+	downloadCmd.Flags().StringVar(&serverURL, "server", config.DefaultServer(), "REST API server base URL")
+	downloadCmd.Flags().StringVar(&authToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
+	downloadCmd.Flags().StringVarP(&outputDir, "output", "o", "", "destination file or directory for the artifact")
 
 	// flash command flags
-	flashCmd.Flags().StringVar(&serverURL, "server", os.Getenv("CAIB_SERVER"), "REST API server base URL")
+	flashCmd.Flags().StringVar(&serverURL, "server", config.DefaultServer(), "REST API server base URL")
 	flashCmd.Flags().StringVar(&authToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
 	flashCmd.Flags().StringVar(&jumpstarterClient, "client", "", "path to Jumpstarter client config file (required)")
 	flashCmd.Flags().StringVarP(&flashName, "name", "n", "", "name for the flash job (auto-generated if omitted)")
 	flashCmd.Flags().StringVarP(&target, "target", "t", "", "target platform for exporter lookup")
 	flashCmd.Flags().StringVar(&exporterSelector, "exporter", "", "direct exporter selector (alternative to --target)")
 	flashCmd.Flags().StringVar(&leaseDuration, "lease", "03:00:00", "device lease duration (HH:MM:SS)")
-	flashCmd.Flags().BoolVarP(&followLogs, "follow", "f", true, "follow flash logs")
+	flashCmd.Flags().BoolVarP(&followLogs, "follow", "f", false, "follow flash logs (shows full log output instead of progress bar)")
 	flashCmd.Flags().BoolVarP(&waitForBuild, "wait", "w", true, "wait for flash to complete")
 	_ = flashCmd.MarkFlagRequired("client")
 
+	// build-container command (Shipwright-based container builds)
+	containerCmd := container.NewContainerCmd()
+
+	// Sealed operations - top-level commands matching AIB CLI structure
+
+	prepareResealCmd := &cobra.Command{
+		Use:   "prepare-reseal [source-container] [output-container]",
+		Short: "Prepare a bootc container image for resealing",
+		Long: `Prepare a bootc container image for resealing. With --server, runs on
+the cluster via the Build API; otherwise runs locally using the AIB container.
+
+Input and output can be given as positionals or via --input and --output (any order).
+
+Examples:
+
+  # Run locally
+  caib prepare-reseal ./input.qcow2 ./output.qcow2 --workspace ./work`,
+		Args: cobra.RangeArgs(0, 2),
+		Run:  runPrepareReseal,
+	}
+
+	resealCmd := &cobra.Command{
+		Use:   "reseal [source-container] [output-container]",
+		Short: "Reseal a prepared bootc container image with a new key",
+		Long: `Reseal a bootc container image that was prepared with prepare-reseal.
+With --server, runs on the cluster via the Build API; otherwise runs locally.
+
+Input and output can be given as positionals or via --input and --output (any order).
+If no seal key is provided, an ephemeral key is generated for one-time use.`,
+		Args: cobra.RangeArgs(0, 2),
+		Run:  runReseal,
+	}
+
+	extractForSigningCmd := &cobra.Command{
+		Use:   "extract-for-signing [source-container] [output-artifact]",
+		Short: "Extract components from a container image for external signing",
+		Long: `Extract components that need to be signed (e.g. for secure boot) from a
+container image. Sign the extracted contents externally, then use inject-signed.
+
+Input and output can be given as positionals or via --input and --output (any order).`,
+		Args: cobra.RangeArgs(0, 2),
+		Run:  runExtractForSigning,
+	}
+
+	injectSignedCmd := &cobra.Command{
+		Use:   "inject-signed [source-container] [signed-artifact] [output-container]",
+		Short: "Inject signed components back into a container image",
+		Long: `Inject externally signed components (from extract-for-signing) back into the
+container image. Optionally reseals in the same step with --key.
+
+Input, signed artifact, and output can be given as positionals or via --input, --signed, --output (any order).`,
+		Args: cobra.RangeArgs(0, 3),
+		Run:  runInjectSigned,
+	}
+
+	// Sealed operation shared flags helper
+	addSealedFlags := func(cmd *cobra.Command) {
+		cmd.Flags().StringVar(&serverURL, "server", config.DefaultServer(), "Build API server URL")
+		cmd.Flags().StringVar(&authToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
+		cmd.Flags().StringVar(&sealedInputRef, "input", "", "Input/source container or artifact ref")
+		cmd.Flags().StringVar(&sealedOutputRef, "output", "", "Output container or artifact ref")
+		cmd.Flags().StringVar(
+			&automotiveImageBuilder, "aib-image",
+			"quay.io/centos-sig-automotive/automotive-image-builder:latest", "AIB container image",
+		)
+		cmd.Flags().StringVar(&sealedBuilderImage, "builder-image", "", "Builder container image (overrides --arch default)")
+		cmd.Flags().StringVar(&sealedArchitecture, "arch", "", "Target architecture for default builder image (amd64, arm64); auto-detected if not set")
+		cmd.Flags().StringArrayVar(&aibExtraArgs, "extra-args", nil, "Extra arguments to pass to AIB (repeatable)")
+		cmd.Flags().BoolVarP(&waitForBuild, "wait", "w", false, "Wait for completion")
+		cmd.Flags().BoolVarP(&followLogs, "follow", "f", true, "Stream task logs")
+		cmd.Flags().StringVar(&sealedKeySecret, "key-secret", "", "Name of existing cluster secret containing sealing key (data key 'private-key')")
+		cmd.Flags().StringVar(&sealedKeyPasswordSecret, "key-password-secret", "", "Name of existing cluster secret containing key password (data key 'password')")
+		cmd.Flags().StringVar(&sealedKeyFile, "key", "", "Path to local PEM key file (uploaded to cluster automatically)")
+		cmd.Flags().StringVar(&sealedKeyPassword, "passwd", "", "Password for encrypted key file (used with --key)")
+		cmd.Flags().IntVar(&timeout, "timeout", 120, "Timeout in minutes")
+	}
+	addSealedFlags(prepareResealCmd)
+	addSealedFlags(resealCmd)
+	addSealedFlags(extractForSigningCmd)
+	addSealedFlags(injectSignedCmd)
+	injectSignedCmd.Flags().StringVar(&sealedSignedRef, "signed", "", "Signed artifact ref for inject-signed")
+
 	// Add all commands
-	rootCmd.AddCommand(buildCmd, diskCmd, buildDevCmd, listCmd, flashCmd, catalog.NewCatalogCmd())
-	// Add deprecated aliases for backwards compatibility
-	rootCmd.AddCommand(buildBootcAliasCmd, buildLegacyAliasCmd, buildTraditionalAliasCmd)
+	rootCmd.AddCommand(buildCmd, diskCmd, buildDevCmd, listCmd, showCmd, downloadCmd, flashCmd, logsCmd, loginCmd,
+		containerCmd, prepareResealCmd, resealCmd, extractForSigningCmd, injectSignedCmd,
+		catalog.NewCatalogCmd(), authcmd.NewAuthCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
@@ -518,41 +768,245 @@ Examples:
 	}
 }
 
+// runLogin saves the server URL and optionally performs OIDC authentication.
+func runLogin(_ *cobra.Command, args []string) {
+	raw := strings.TrimSpace(args[0])
+	if raw == "" {
+		handleError(fmt.Errorf("server URL is required"))
+	}
+	server := raw
+	if !strings.HasPrefix(server, "http://") && !strings.HasPrefix(server, "https://") {
+		server = "https://" + server
+	}
+	if err := config.SaveServerURL(server); err != nil {
+		handleError(fmt.Errorf("failed to save server URL: %w", err))
+	}
+	fmt.Printf("Server saved: %s\n", server)
+
+	ctx := context.Background()
+	token, didAuth, err := auth.GetTokenWithReauth(ctx, server, "", insecureSkipTLS)
+	if err != nil {
+		fmt.Printf("Warning: authentication failed (you may need --token or kubeconfig for API calls): %v\n", err)
+		return
+	}
+	if token != "" && didAuth {
+		fmt.Println("OIDC authentication successful. Token cached for subsequent commands.")
+	} else if token != "" {
+		fmt.Println("Using existing or kubeconfig token. You can run build/list/disk commands without --server.")
+	}
+}
+
+// validateBootcBuildFlags validates flag combinations for the build command
+func validateBootcBuildFlags() {
+	if serverURL == "" {
+		handleError(fmt.Errorf("--server is required (or set CAIB_SERVER, or run 'caib login <server-url>')"))
+	}
+
+	if useInternalRegistry {
+		if exportOCI != "" {
+			handleError(fmt.Errorf("--internal-registry cannot be used with --push-disk"))
+		}
+	}
+
+	if outputDir != "" && !buildDiskImage {
+		buildDiskImage = true
+	}
+	if exportOCI != "" && !buildDiskImage {
+		buildDiskImage = true
+	}
+	if flashAfterBuild && !buildDiskImage {
+		buildDiskImage = true
+	}
+	if !useInternalRegistry {
+		validateOutputRequiresPush(outputDir, exportOCI, "--push-disk")
+	}
+
+	if containerPush == "" && !buildDiskImage && !useInternalRegistry {
+		handleError(fmt.Errorf(
+			"--push is required when not building a disk image " +
+				"(use --disk or --output to create a disk image without pushing the container)",
+		))
+	}
+}
+
+// applyRegistryCredentialsToRequest sets registry credentials on the build request.
+// When --internal-registry is combined with --push, both are configured so the
+// container is pushed externally while the disk image uses the internal registry.
+func applyRegistryCredentialsToRequest(req *buildapitypes.BuildRequest) {
+	if useInternalRegistry {
+		req.UseInternalRegistry = true
+		req.InternalRegistryImageName = internalRegistryImageName
+		req.InternalRegistryTag = internalRegistryTag
+		if containerPush == "" {
+			return
+		}
+		// Hybrid: fall through to also set external registry credentials
+		// for the container push.
+	}
+
+	effectiveRegistryURL, registryUsername, registryPassword := registryauth.ExtractRegistryCredentials(containerPush, exportOCI)
+	registryCreds, err := registryauth.ResolveRegistryCredentials(effectiveRegistryURL, registryUsername, registryPassword, registryAuthFile)
+	if err != nil {
+		handleError(err)
+	}
+	req.RegistryCredentials = registryCreds
+}
+
+// fetchTargetDefaults fetches the operator config once and returns it.
+// If flash is enabled, it also validates that the target has a Jumpstarter mapping.
+func fetchTargetDefaults(ctx context.Context, api *buildapiclient.Client, target string, validateFlash bool) *buildapitypes.OperatorConfigResponse {
+	config, err := api.GetOperatorConfig(ctx)
+	if err != nil {
+		// Non-fatal for defaults: if we can't reach the config endpoint, just skip defaults
+		if !validateFlash {
+			fmt.Fprintf(os.Stderr, "Warning: could not fetch operator config for target defaults: %v\n", err)
+			return nil
+		}
+		handleError(fmt.Errorf("failed to get operator configuration for Jumpstarter validation: %w", err))
+	}
+
+	if validateFlash {
+		if len(config.JumpstarterTargets) == 0 {
+			handleError(fmt.Errorf("flash enabled but no Jumpstarter target mappings configured in operator"))
+		}
+
+		if _, exists := config.JumpstarterTargets[target]; !exists {
+			availableTargets := make([]string, 0, len(config.JumpstarterTargets))
+			for t := range config.JumpstarterTargets {
+				availableTargets = append(availableTargets, t)
+			}
+			handleError(
+				fmt.Errorf(
+					"flash enabled but no Jumpstarter target mapping found for target %q. Available targets: %v",
+					target,
+					availableTargets,
+				),
+			)
+		}
+	}
+
+	return config
+}
+
+// applyTargetDefaults applies architecture and extra-args defaults from the operator config
+// target defaults (ConfigMap). CLI flags override defaults when explicitly set.
+func applyTargetDefaults(cmd *cobra.Command, config *buildapitypes.OperatorConfigResponse, req *buildapitypes.BuildRequest) {
+	if config == nil || len(config.TargetDefaults) == 0 {
+		return
+	}
+
+	defaults, exists := config.TargetDefaults[string(req.Target)]
+	if !exists {
+		return
+	}
+
+	if defaults.Architecture != "" && !cmd.Flags().Changed("arch") {
+		req.Architecture = buildapitypes.Architecture(defaults.Architecture)
+		fmt.Printf("Using architecture %q from target defaults for %q\n", defaults.Architecture, req.Target)
+	}
+
+	if len(defaults.ExtraArgs) > 0 {
+		// Default args come first, user args appended
+		req.AIBExtraArgs = append(defaults.ExtraArgs, req.AIBExtraArgs...)
+		fmt.Printf("Prepending extra args %v from target defaults for %q\n", defaults.ExtraArgs, req.Target)
+	}
+}
+
+// displayBuildResults shows push locations after build completion
+func displayBuildResults(ctx context.Context, api *buildapiclient.Client, buildName string) {
+	labelColor := func(a ...any) string { return fmt.Sprint(a...) }
+	valueColor := func(a ...any) string { return fmt.Sprint(a...) }
+	if supportsColorOutput() {
+		labelColor = color.New(color.FgHiWhite, color.Bold).SprintFunc()
+		valueColor = color.New(color.FgHiGreen).SprintFunc()
+	}
+
+	if useInternalRegistry {
+		st, err := api.GetBuild(ctx, buildName)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to get build results for %s: %v\n", buildName, err)
+			return
+		}
+		if st.ContainerImage != "" {
+			fmt.Printf("%s %s\n", labelColor("Container image:"), valueColor(st.ContainerImage))
+		}
+		if st.DiskImage != "" {
+			fmt.Printf("%s %s\n", labelColor("Disk image:"), valueColor(st.DiskImage))
+		}
+		if st.RegistryToken != "" {
+			if outputDir != "" && st.DiskImage != "" {
+				downloadOCIArtifactIfRequested(outputDir, st.DiskImage, "serviceaccount", st.RegistryToken, insecureSkipTLS)
+			} else {
+				credsFile, err := writeRegistryCredentialsFile(st.RegistryToken)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to write registry credentials file: %v\n", err)
+					fmt.Printf("\n%s\n", labelColor("Registry credentials (valid ~4 hours):"))
+					fmt.Printf("  %s %s\n", labelColor("Username:"), valueColor("serviceaccount"))
+					fmt.Printf("  %s %s\n", labelColor("Token:"), valueColor(st.RegistryToken))
+				} else {
+					fmt.Printf("\n%s %s (valid ~4 hours)\n",
+						labelColor("Registry credentials written to:"),
+						valueColor(credsFile))
+				}
+			}
+		}
+	} else {
+		if containerPush != "" {
+			fmt.Printf("%s %s\n", labelColor("Container image pushed to:"), valueColor(containerPush))
+		}
+		if exportOCI != "" {
+			fmt.Printf("%s %s\n", labelColor("Disk image pushed to:"), valueColor(exportOCI))
+		}
+		if outputDir != "" {
+			_, registryUsername, registryPassword := registryauth.ExtractRegistryCredentials(containerPush, exportOCI)
+			downloadOCIArtifactIfRequested(outputDir, exportOCI, registryUsername, registryPassword, insecureSkipTLS)
+		}
+	}
+}
+
+func displayBuildLogsCommand(buildName string) {
+	labelColor := func(a ...any) string { return fmt.Sprint(a...) }
+	commandColor := func(a ...any) string { return fmt.Sprint(a...) }
+	if supportsColorOutput() {
+		labelColor = color.New(color.FgHiWhite, color.Bold).SprintFunc()
+		commandColor = color.New(color.FgHiYellow, color.Bold).SprintFunc()
+	}
+
+	fmt.Printf("\n%s\n  %s\n\n", labelColor("View build logs:"), commandColor("caib logs "+buildName))
+}
+
+func applyWaitFollowDefaults(cmd *cobra.Command, defaultWait, defaultFollow bool) {
+	if cmd == nil {
+		return
+	}
+	if !cmd.Flags().Changed("wait") {
+		waitForBuild = defaultWait
+	}
+	if !cmd.Flags().Changed("follow") {
+		followLogs = defaultFollow
+	}
+}
+
 // runBuild handles the main 'build' command (bootc builds)
-func runBuild(_ *cobra.Command, args []string) {
+func runBuild(cmd *cobra.Command, args []string) {
+	applyWaitFollowDefaults(cmd, true, false)
+
 	ctx := context.Background()
 	manifest = args[0]
 
-	if serverURL == "" {
-		handleError(fmt.Errorf("--server is required (or set CAIB_SERVER env)"))
-	}
-	validateOutputRequiresPush(outputDir, exportOCI, "--push")
+	validateManifestSuffix(manifest)
+	validateBootcBuildFlags()
 
-	// Auto-generate build name if not provided
 	if buildName == "" {
-		base := strings.TrimSuffix(filepath.Base(manifest), ".aib.yml")
-		base = strings.TrimSuffix(base, ".yml")
-		buildName = fmt.Sprintf("%s-%s", base, time.Now().Format("20060102-150405"))
+		base := filepath.Base(manifest)
+		for _, suffix := range validManifestSuffixes {
+			base = strings.TrimSuffix(base, suffix)
+		}
+		buildName = fmt.Sprintf("%s-%s", sanitizeBuildName(base), time.Now().Format("20060102-150405"))
 		fmt.Printf("Auto-generated build name: %s\n", buildName)
+	} else {
+		validateBuildName(buildName)
 	}
-
-	// Validate: if --output is specified, --disk must also be specified
-	if outputDir != "" && !buildDiskImage {
-		buildDiskImage = true // imply --disk when --output is specified
-	}
-	validateOutputRequiresPush(outputDir, exportOCI, "--push-disk")
-
-	// Validate: --push is required unless we're building a disk image
-	// (disk image becomes the output, so container push is optional)
-	if containerPush == "" && !buildDiskImage {
-		err := fmt.Errorf(
-			"--push is required when not building a disk image " +
-				"(use --disk or --output to create a disk image without pushing the container)",
-		)
-		handleError(err)
-	}
-
-	// Note: diskFormat can be empty - AIB will default to raw (or infer from output filename extension)
 
 	api, err := createBuildAPIClient(serverURL, &authToken)
 	if err != nil {
@@ -562,14 +1016,6 @@ func runBuild(_ *cobra.Command, args []string) {
 	manifestBytes, err := os.ReadFile(manifest)
 	if err != nil {
 		handleError(fmt.Errorf("error reading manifest: %w", err))
-	}
-
-	// Extract registry URL and credentials
-	effectiveRegistryURL, registryUsername, registryPassword := extractRegistryCredentials(containerPush, exportOCI)
-
-	// Validate credentials (error on partial credentials)
-	if err := validateRegistryCredentials(effectiveRegistryURL, registryUsername, registryPassword); err != nil {
-		handleError(err)
 	}
 
 	req := buildapitypes.BuildRequest{
@@ -590,12 +1036,18 @@ func runBuild(_ *cobra.Command, args []string) {
 		BuildDiskImage:         buildDiskImage,
 		ExportOCI:              exportOCI,
 		BuilderImage:           builderImage,
+		RebuildBuilder:         rebuildBuilder,
 	}
+
+	applyRegistryCredentialsToRequest(&req)
+
+	// Fetch target defaults and apply them to the request
+	operatorConfig := fetchTargetDefaults(ctx, api, target, flashAfterBuild)
+	applyTargetDefaults(cmd, operatorConfig, &req)
 
 	// Add flash configuration if enabled
 	if flashAfterBuild {
-		// Flash requires a disk image pushed to a registry
-		if exportOCI == "" {
+		if exportOCI == "" && !useInternalRegistry {
 			handleError(fmt.Errorf("cannot enable --flash without exporting a disk image (--push-disk)"))
 		}
 		if jumpstarterClient == "" {
@@ -610,21 +1062,12 @@ func runBuild(_ *cobra.Command, args []string) {
 		req.FlashLeaseDuration = leaseDuration
 	}
 
-	if effectiveRegistryURL != "" && registryUsername != "" && registryPassword != "" {
-		req.RegistryCredentials = &buildapitypes.RegistryCredentials{
-			Enabled:     true,
-			AuthType:    "username-password",
-			RegistryURL: effectiveRegistryURL,
-			Username:    registryUsername,
-			Password:    registryPassword,
-		}
-	}
-
 	resp, err := api.CreateBuild(ctx, req)
 	if err != nil {
 		handleError(err)
 	}
 	fmt.Printf("Build %s accepted: %s - %s\n", resp.Name, resp.Phase, resp.Message)
+	displayBuildLogsCommand(resp.Name)
 
 	// Handle local file uploads if needed
 	localRefs, err := findLocalFileReferences(string(manifestBytes))
@@ -639,55 +1082,44 @@ func runBuild(_ *cobra.Command, args []string) {
 		waitForBuildCompletion(ctx, api, resp.Name)
 	}
 
-	// Show push locations after successful build completion
-	if containerPush != "" {
-		fmt.Printf("Container image pushed to: %s\n", containerPush)
-	}
-	if exportOCI != "" {
-		fmt.Printf("Disk image pushed to: %s\n", exportOCI)
-	}
-
-	downloadOCIArtifactIfRequested(outputDir, exportOCI, registryUsername, registryPassword)
-
-	// Note: When flashAfterBuild is enabled, flash config is sent with the build request
-	// and the controller handles flashing after push. The waitForBuildCompletion above
-	// will wait until the full pipeline (including flash) completes.
+	displayBuildResults(ctx, api, resp.Name)
 }
 
-func runDisk(_ *cobra.Command, args []string) {
+func runDisk(cmd *cobra.Command, args []string) {
+	applyWaitFollowDefaults(cmd, false, false)
+
 	ctx := context.Background()
 	containerRef = args[0]
 
 	if serverURL == "" {
-		handleError(fmt.Errorf("--server is required (or set CAIB_SERVER env)"))
+		handleError(fmt.Errorf("--server is required (or set CAIB_SERVER, or run 'caib login <server-url>')"))
 	}
 
-	// Validate: need either --output or --push
-	if outputDir == "" && exportOCI == "" {
-		handleError(fmt.Errorf("either --output or --push is required"))
+	if useInternalRegistry {
+		if exportOCI != "" {
+			handleError(fmt.Errorf("--internal-registry cannot be used with --push"))
+		}
+	} else {
+		// Validate: need either --output or --push
+		if outputDir == "" && exportOCI == "" {
+			handleError(fmt.Errorf("either --output or --push is required"))
+		}
+		validateOutputRequiresPush(outputDir, exportOCI, "--push")
 	}
-	validateOutputRequiresPush(outputDir, exportOCI, "--push")
 
 	// Auto-generate build name if not provided
 	if buildName == "" {
-		// Extract image name from container ref for the build name
 		parts := strings.Split(containerRef, "/")
 		imagePart := parts[len(parts)-1]
 		imagePart = strings.Split(imagePart, ":")[0] // remove tag
-		buildName = fmt.Sprintf("disk-%s-%s", imagePart, time.Now().Format("20060102-150405"))
+		buildName = fmt.Sprintf("disk-%s-%s", sanitizeBuildName(imagePart), time.Now().Format("20060102-150405"))
 		fmt.Printf("Auto-generated build name: %s\n", buildName)
+	} else {
+		validateBuildName(buildName)
 	}
 
 	api, err := createBuildAPIClient(serverURL, &authToken)
 	if err != nil {
-		handleError(err)
-	}
-
-	// Extract registry URL and credentials
-	effectiveRegistryURL, registryUsername, registryPassword := extractRegistryCredentials(containerRef, exportOCI)
-
-	// Validate credentials (error on partial credentials)
-	if err := validateRegistryCredentials(effectiveRegistryURL, registryUsername, registryPassword); err != nil {
 		handleError(err)
 	}
 
@@ -706,10 +1138,15 @@ func runDisk(_ *cobra.Command, args []string) {
 		ExportOCI:              exportOCI,
 	}
 
+	applyRegistryCredentialsToRequest(&req)
+
+	// Fetch target defaults and apply them to the request
+	operatorConfig := fetchTargetDefaults(ctx, api, target, flashAfterBuild)
+	applyTargetDefaults(cmd, operatorConfig, &req)
+
 	// Add flash configuration if enabled
 	if flashAfterBuild {
-		// Flash requires a disk image pushed to a registry
-		if exportOCI == "" {
+		if exportOCI == "" && !useInternalRegistry {
 			handleError(fmt.Errorf("cannot enable --flash without exporting a disk image (--push)"))
 		}
 		if jumpstarterClient == "" {
@@ -724,39 +1161,21 @@ func runDisk(_ *cobra.Command, args []string) {
 		req.FlashLeaseDuration = leaseDuration
 	}
 
-	if effectiveRegistryURL != "" && registryUsername != "" && registryPassword != "" {
-		req.RegistryCredentials = &buildapitypes.RegistryCredentials{
-			Enabled:     true,
-			AuthType:    "username-password",
-			RegistryURL: effectiveRegistryURL,
-			Username:    registryUsername,
-			Password:    registryPassword,
-		}
-	}
-
 	resp, err := api.CreateBuild(ctx, req)
 	if err != nil {
 		handleError(err)
 	}
 	fmt.Printf("Build %s accepted: %s - %s\n", resp.Name, resp.Phase, resp.Message)
+	displayBuildLogsCommand(resp.Name)
 
 	if waitForBuild || followLogs || outputDir != "" || flashAfterBuild {
 		waitForBuildCompletion(ctx, api, resp.Name)
 	}
 
-	// Show push location after successful build completion
-	if exportOCI != "" {
-		fmt.Printf("Disk image pushed to: %s\n", exportOCI)
-	}
-
-	downloadOCIArtifactIfRequested(outputDir, exportOCI, registryUsername, registryPassword)
-
-	// Note: When flashAfterBuild is enabled, flash config is sent with the build request
-	// and the controller handles flashing after push. The waitForBuildCompletion above
-	// will wait until the full pipeline (including flash) completes.
+	displayBuildResults(ctx, api, resp.Name)
 }
 
-func pullOCIArtifact(ociRef, destPath, username, password string) error {
+func pullOCIArtifact(ociRef, destPath, username, password string, insecureSkipTLS bool) error {
 	fmt.Printf("Pulling OCI artifact %s to %s\n", ociRef, destPath)
 
 	// Ensure output directory exists
@@ -778,12 +1197,13 @@ func pullOCIArtifact(ociRef, destPath, username, password string) error {
 			Password: password,
 		}
 	} else {
-		fmt.Printf("No explicit credentials provided, will use Docker/Podman auth files if available\n")
-		// containers/image will automatically use:
-		// - $HOME/.docker/config.json
-		// - $XDG_RUNTIME_DIR/containers/auth.json
-		// - /run/containers/$UID/auth.json
-		// - $HOME/.config/containers/auth.json
+		fmt.Printf("No explicit credentials provided, will use local container auth files if available\n")
+	}
+
+	// Configure TLS verification
+	if insecureSkipTLS {
+		systemCtx.OCIInsecureSkipTLSVerify = insecureSkipTLS
+		systemCtx.DockerInsecureSkipTLSVerify = types.OptionalBoolTrue
 	}
 
 	// Set up policy context (allow all)
@@ -975,6 +1395,47 @@ func extractOCIArtifactBlob(ociLayoutPath, destPath string) error {
 	return copyFile(layerPath, destPath)
 }
 
+// sanitizeBuildName converts a string into a valid RFC 1123 subdomain name
+// suitable for use as a Kubernetes resource name. It lowercases the input,
+// replaces invalid characters (underscores, dots, etc.) with hyphens,
+// collapses consecutive hyphens, and trims leading/trailing hyphens.
+func sanitizeBuildName(name string) string {
+	name = strings.ToLower(name)
+	var b strings.Builder
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	// Collapse consecutive hyphens
+	result := multiHyphenRe.ReplaceAllString(b.String(), "-")
+	return strings.Trim(result, "-")
+}
+
+// validateBuildName checks a user-provided build name and exits if it
+// contains only invalid characters after sanitization.
+var validManifestSuffixes = []string{".aib.yml", ".mpp.yml"}
+
+func validateManifestSuffix(filename string) {
+	for _, suffix := range validManifestSuffixes {
+		if strings.HasSuffix(filename, suffix) {
+			return
+		}
+	}
+	handleError(fmt.Errorf("manifest file %q must have one of the following extensions: %s",
+		filepath.Base(filename), strings.Join(validManifestSuffixes, ", ")))
+}
+
+func validateBuildName(name string) {
+	if sanitizeBuildName(name) == "" {
+		fmt.Printf("Error: build name '%s' contains only invalid characters\n", name)
+		fmt.Println("Build names must contain at least one letter or number")
+		os.Exit(1)
+	}
+}
+
 // sanitizeFilename validates and sanitizes a filename from OCI layer annotations.
 // Returns a safe filename, falling back to "layer-N.bin" if the input is invalid.
 // This prevents path traversal attacks by rejecting:
@@ -1054,21 +1515,36 @@ func copyFile(srcPath, dstPath string) error {
 }
 
 // runBuildDev handles the 'build-dev' command (traditional ostree/package builds)
-func runBuildDev(_ *cobra.Command, args []string) {
+func runBuildDev(cmd *cobra.Command, args []string) {
+	applyWaitFollowDefaults(cmd, false, false)
+
 	ctx := context.Background()
 	manifest = args[0]
 
+	validateManifestSuffix(manifest)
+
 	if serverURL == "" {
-		handleError(fmt.Errorf("--server is required (or set CAIB_SERVER env)"))
+		handleError(fmt.Errorf("--server is required (or set CAIB_SERVER, or run 'caib login <server-url>')"))
 	}
-	validateOutputRequiresPush(outputDir, exportOCI, "--push")
+
+	if useInternalRegistry {
+		if exportOCI != "" {
+			handleError(fmt.Errorf("--internal-registry cannot be used with --push"))
+		}
+	} else {
+		validateOutputRequiresPush(outputDir, exportOCI, "--push")
+	}
 
 	// Auto-generate build name if not provided
 	if buildName == "" {
-		base := strings.TrimSuffix(filepath.Base(manifest), ".aib.yml")
-		base = strings.TrimSuffix(base, ".yml")
-		buildName = fmt.Sprintf("%s-%s", base, time.Now().Format("20060102-150405"))
+		base := filepath.Base(manifest)
+		for _, suffix := range validManifestSuffixes {
+			base = strings.TrimSuffix(base, suffix)
+		}
+		buildName = fmt.Sprintf("%s-%s", sanitizeBuildName(base), time.Now().Format("20060102-150405"))
 		fmt.Printf("Auto-generated build name: %s\n", buildName)
+	} else {
+		validateBuildName(buildName)
 	}
 
 	api, err := createBuildAPIClient(serverURL, &authToken)
@@ -1092,14 +1568,6 @@ func runBuildDev(_ *cobra.Command, args []string) {
 		handleError(fmt.Errorf("invalid --mode %q (expected: %q or %q)", mode, buildapitypes.ModeImage, buildapitypes.ModePackage))
 	}
 
-	// Extract registry URL and credentials
-	effectiveRegistryURL, registryUsername, registryPassword := extractRegistryCredentials("", exportOCI)
-
-	// Validate credentials (error on partial credentials)
-	if err := validateRegistryCredentials(effectiveRegistryURL, registryUsername, registryPassword); err != nil {
-		handleError(err)
-	}
-
 	req := buildapitypes.BuildRequest{
 		Name:                   buildName,
 		Manifest:               string(manifestBytes),
@@ -1117,15 +1585,21 @@ func runBuildDev(_ *cobra.Command, args []string) {
 		ExportOCI:              exportOCI,
 	}
 
+	applyRegistryCredentialsToRequest(&req)
+
+	// Fetch target defaults and apply them to the request
+	operatorConfig := fetchTargetDefaults(ctx, api, target, flashAfterBuild)
+	applyTargetDefaults(cmd, operatorConfig, &req)
+
 	// Add flash configuration if enabled
 	if flashAfterBuild {
-		// Flash requires a disk image pushed to a registry
-		if exportOCI == "" {
+		if exportOCI == "" && !useInternalRegistry {
 			handleError(fmt.Errorf("cannot enable --flash without exporting a disk image (--push)"))
 		}
 		if jumpstarterClient == "" {
 			handleError(fmt.Errorf("--flash requires --client to specify Jumpstarter client config file"))
 		}
+
 		clientConfigBytes, err := os.ReadFile(jumpstarterClient)
 		if err != nil {
 			handleError(fmt.Errorf("failed to read Jumpstarter client config: %w", err))
@@ -1135,21 +1609,12 @@ func runBuildDev(_ *cobra.Command, args []string) {
 		req.FlashLeaseDuration = leaseDuration
 	}
 
-	if effectiveRegistryURL != "" && registryUsername != "" && registryPassword != "" {
-		req.RegistryCredentials = &buildapitypes.RegistryCredentials{
-			Enabled:     true,
-			AuthType:    "username-password",
-			RegistryURL: effectiveRegistryURL,
-			Username:    registryUsername,
-			Password:    registryPassword,
-		}
-	}
-
 	resp, err := api.CreateBuild(ctx, req)
 	if err != nil {
 		handleError(err)
 	}
 	fmt.Printf("Build %s accepted: %s - %s\n", resp.Name, resp.Phase, resp.Message)
+	displayBuildLogsCommand(resp.Name)
 
 	// Handle local file uploads if needed
 	localRefs, err := findLocalFileReferences(string(manifestBytes))
@@ -1163,11 +1628,8 @@ func runBuildDev(_ *cobra.Command, args []string) {
 	if waitForBuild || followLogs || outputDir != "" || flashAfterBuild {
 		waitForBuildCompletion(ctx, api, resp.Name)
 	}
-	downloadOCIArtifactIfRequested(outputDir, exportOCI, registryUsername, registryPassword)
 
-	// Note: When flashAfterBuild is enabled, flash config is sent with the build request
-	// and the controller handles flashing after push. The waitForBuildCompletion above
-	// will wait until the full pipeline (including flash) completes.
+	displayBuildResults(ctx, api, resp.Name)
 }
 
 func handleFileUploads(
@@ -1243,18 +1705,26 @@ func waitForBuildCompletion(ctx context.Context, api *buildapiclient.Client, nam
 	pendingWarningShown := false
 	retryLimitWarningShown := false
 
+	logTransport := &http.Transport{
+		ResponseHeaderTimeout: 30 * time.Second,
+		IdleConnTimeout:       2 * time.Minute,
+	}
+	if insecureSkipTLS {
+		logTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	// No hard Timeout on the client: log streams can run for the entire
+	// build duration (often >10 min). The build's context timeout
+	// (timeoutCtx) already governs cancellation via the request context.
 	logClient := &http.Client{
-		Timeout: 10 * time.Minute,
-		Transport: &http.Transport{
-			ResponseHeaderTimeout: 30 * time.Second,
-			IdleConnTimeout:       2 * time.Minute,
-		},
+		Transport: logTransport,
 	}
 	streamState := &logStreamState{}
+	pb := ui.NewProgressBar()
 
 	for {
 		select {
 		case <-timeoutCtx.Done():
+			pb.Clear()
 			handleError(fmt.Errorf("timed out waiting for build"))
 		case <-ticker.C:
 			reqCtx, cancelReq := context.WithTimeout(ctx, 2*time.Minute)
@@ -1265,8 +1735,23 @@ func waitForBuildCompletion(ctx context.Context, api *buildapiclient.Client, nam
 				continue
 			}
 
-			// Update status display (only when not streaming)
-			if !streamState.active && (!userFollowRequested || !streamState.canRetry()) {
+			// Progress bar mode: when not following logs, poll progress endpoint
+			if !followLogs && !streamState.active {
+				progressCtx, progressCancel := context.WithTimeout(ctx, 10*time.Second)
+				progress, _ := api.GetBuildProgress(progressCtx, name)
+				progressCancel()
+				// Use phase from progress response (fresher than GetBuild)
+				displayPhase := st.Phase
+				var step *buildapitypes.BuildStep
+				if progress != nil {
+					step = progress.Step
+					if progress.Phase != "" {
+						displayPhase = progress.Phase
+					}
+				}
+				pb.Render(displayPhase, step)
+			} else if !streamState.active && (!userFollowRequested || !streamState.canRetry()) {
+				// Fallback: text status when streaming is not active
 				if st.Phase != lastPhase || st.Message != lastMessage {
 					fmt.Printf("status: %s - %s\n", st.Phase, st.Message)
 					lastPhase = st.Phase
@@ -1275,13 +1760,24 @@ func waitForBuildCompletion(ctx context.Context, api *buildapiclient.Client, nam
 			}
 
 			// Handle terminal build states
-			if st.Phase == "Completed" {
+			if st.Phase == phaseCompleted {
+				pb.Clear()
 				flashWasExecuted := strings.Contains(st.Message, "flash")
 				if flashWasExecuted {
-					fmt.Println("\n" + strings.Repeat("=", 50))
-					fmt.Println("Build and flash completed successfully!")
-					fmt.Println(strings.Repeat("=", 50))
-					fmt.Println("\nThe device has been flashed and a lease has been acquired.")
+					bannerColor := func(a ...any) string { return fmt.Sprint(a...) }
+					infoColor := func(a ...any) string { return fmt.Sprint(a...) }
+					commandColor := func(a ...any) string { return fmt.Sprint(a...) }
+					if supportsColorOutput() {
+						bannerColor = color.New(color.FgHiGreen, color.Bold).SprintFunc()
+						infoColor = color.New(color.FgHiWhite).SprintFunc()
+						commandColor = color.New(color.FgHiYellow, color.Bold).SprintFunc()
+					}
+
+					divider := strings.Repeat("=", 50)
+					fmt.Println("\n" + bannerColor(divider))
+					fmt.Println(bannerColor("Build and flash completed successfully!"))
+					fmt.Println(bannerColor(divider))
+					fmt.Println("\n" + infoColor("The device has been flashed and a lease has been acquired."))
 					// Get lease ID from API response (preferred) or fall back to log parsing
 					leaseID := ""
 					if st.Jumpstarter != nil && st.Jumpstarter.LeaseID != "" {
@@ -1290,18 +1786,18 @@ func waitForBuildCompletion(ctx context.Context, api *buildapiclient.Client, nam
 						leaseID = streamState.leaseID
 					}
 					if leaseID != "" {
-						fmt.Printf("\nLease ID: %s\n", leaseID)
-						fmt.Println("\nTo access the device:")
-						fmt.Printf("  jmp shell --lease %s\n", leaseID)
-						fmt.Println("\nTo release the lease when done:")
-						fmt.Printf("  jmp delete leases %s\n", leaseID)
+						fmt.Printf("\n%s %s\n", infoColor("Lease ID:"), commandColor(leaseID))
+						fmt.Printf("\n%s\n", infoColor("To access the device:"))
+						fmt.Printf("  %s\n", commandColor(fmt.Sprintf("jmp shell --lease %s", leaseID)))
+						fmt.Printf("\n%s\n", infoColor("To release the lease when done:"))
+						fmt.Printf("  %s\n", commandColor(fmt.Sprintf("jmp delete leases %s", leaseID)))
 					} else {
-						fmt.Println("Check the logs above for lease details, or use:")
-						fmt.Println("  jmp list leases")
-						fmt.Println("\nTo access the device:")
-						fmt.Println("  jmp shell --lease <lease-id>")
-						fmt.Println("\nTo release the lease when done:")
-						fmt.Println("  jmp delete leases <lease-id>")
+						fmt.Println(infoColor("Check the logs above for lease details, or use:"))
+						fmt.Printf("  %s\n", commandColor("jmp list leases"))
+						fmt.Printf("\n%s\n", infoColor("To access the device:"))
+						fmt.Printf("  %s\n", commandColor("jmp shell --lease <lease-id>"))
+						fmt.Printf("\n%s\n", infoColor("To release the lease when done:"))
+						fmt.Printf("  %s\n", commandColor("jmp delete leases <lease-id>"))
 					}
 				} else {
 					fmt.Println("Build completed successfully!")
@@ -1310,40 +1806,60 @@ func waitForBuildCompletion(ctx context.Context, api *buildapiclient.Client, nam
 						fmt.Println("This may be because no Jumpstarter target mapping exists for this target.")
 						fmt.Println("Check OperatorConfig for JumpstarterTargetMappings configuration.")
 					}
-					if st.Jumpstarter != nil && st.Jumpstarter.Available {
-						fmt.Println("\nJumpstarter is available")
-						if st.Jumpstarter.ExporterSelector != "" {
-							fmt.Println("matching exporter(s) found")
-							fmt.Printf("  Exporter selector: %s\n", st.Jumpstarter.ExporterSelector)
-						}
-						if st.Jumpstarter.FlashCmd != "" {
-							fmt.Printf("  Flash command: %s\n", st.Jumpstarter.FlashCmd)
-						}
-					}
+					// Show flash instructions with colors
+					displayFlashInstructions(st, false)
 				}
 				return
 			}
 			if st.Phase == phaseFailed {
+				pb.Clear()
 				// Provide phase-specific error messages
-				errPrefix := "build"
-				if strings.Contains(strings.ToLower(st.Message), "flash") {
-					errPrefix = "flash"
-				} else if strings.Contains(strings.ToLower(st.Message), "push") {
-					errPrefix = "push"
-				} else if lastPhase == "Flashing" {
-					errPrefix = "flash"
+				errPrefix := errPrefixBuild
+				isFlashFailure := false
+
+				if strings.Contains(strings.ToLower(st.Message), errPrefixFlash) {
+					errPrefix = errPrefixFlash
+					isFlashFailure = true
+				} else if strings.Contains(strings.ToLower(st.Message), errPrefixPush) {
+					errPrefix = errPrefixPush
+				} else if lastPhase == phaseFlashing {
+					errPrefix = errPrefixFlash
+					isFlashFailure = true
 				} else if lastPhase == "Pushing" {
-					errPrefix = "push"
+					errPrefix = errPrefixPush
+				} else if flashAfterBuild && (lastPhase == phaseFlashing || strings.Contains(strings.ToLower(st.Message), errPrefixFlash)) {
+					// Only treat as flash failure if we actually reached a flash-related phase
+					// or the error message explicitly indicates a flash error
+					errPrefix = errPrefixFlash
+					isFlashFailure = true
 				}
-				handleError(fmt.Errorf("%s failed: %s", errPrefix, st.Message))
+
+				err := fmt.Errorf("%s failed: %s", errPrefix, st.Message)
+				if isFlashFailure {
+					handleFlashError(err, st)
+				} else {
+					handleError(err)
+				}
 			}
 
 			// Attempt log streaming for active builds
-			if !followLogs || streamState.active || !streamState.canRetry() {
+			if !followLogs || streamState.active {
 				continue
 			}
 
-			if st.Phase == "Pending" {
+			// If the stream ended cleanly but the build is still active
+			// (e.g. stream covered build tasks but flash pod hadn't appeared yet),
+			// allow reconnection so we pick up remaining task logs.
+			if streamState.completed && isBuildActive(st.Phase) {
+				streamState.completed = false
+				streamState.retryCount = 0
+			}
+
+			if !streamState.canRetry() {
+				continue
+			}
+
+			if st.Phase == phasePending {
 				streamState.reset()
 				if userFollowRequested && !pendingWarningShown {
 					fmt.Println("Waiting for build to start before streaming logs...")
@@ -1396,7 +1912,7 @@ func (s *logStreamState) reset() {
 }
 
 func isBuildActive(phase string) bool {
-	return phase == "Building" || phase == "Running" || phase == "Uploading" || phase == "Flashing"
+	return phase == "Building" || phase == phaseRunning || phase == "Uploading" || phase == phaseFlashing
 }
 
 // tryLogStreaming attempts to stream logs and returns error if it fails
@@ -1434,11 +1950,14 @@ func buildLogURL(buildName string, startTime time.Time) string {
 }
 
 func streamLogsToStdout(body io.Reader, state *logStreamState) error {
-	if state.startTime.IsZero() {
+	firstStream := state.startTime.IsZero()
+	if firstStream {
 		state.startTime = time.Now()
 	}
 
-	fmt.Println("Streaming logs...")
+	if firstStream {
+		fmt.Println("Streaming logs...")
+	}
 	state.active = true
 	state.reset()
 
@@ -1448,6 +1967,8 @@ func streamLogsToStdout(body io.Reader, state *logStreamState) error {
 	for scanner.Scan() {
 		line := scanner.Text()
 		fmt.Println(line)
+		// Advance startTime so reconnections only fetch new logs
+		state.startTime = time.Now()
 
 		// Capture lease ID from flash logs
 		// Format: "jmp shell --lease <lease-id>" or "Lease acquired: <lease-id>"
@@ -1505,6 +2026,124 @@ func handleLogStreamError(resp *http.Response, state *logStreamState) error {
 
 func handleError(err error) {
 	fmt.Printf("Error: %v\n", err)
+	os.Exit(1)
+}
+
+func replaceFlashImagePlaceholders(cmd, imageURI string) string {
+	cmd = strings.ReplaceAll(cmd, "{image_uri}", imageURI)
+	cmd = strings.ReplaceAll(cmd, "{artifact_url}", imageURI)
+	cmd = strings.ReplaceAll(cmd, "${IMAGE}", imageURI)
+	cmd = strings.ReplaceAll(cmd, "${IMAGE_REF}", imageURI)
+	return cmd
+}
+
+func hasUnresolvedFlashImagePlaceholder(cmd string) bool {
+	placeholders := []string{
+		"{image_uri}",
+		"{artifact_url}",
+		"${IMAGE}",
+		"${IMAGE_REF}",
+	}
+	for _, placeholder := range placeholders {
+		if strings.Contains(cmd, placeholder) {
+			return true
+		}
+	}
+	return false
+}
+
+// displayFlashInstructions shows colorful flashing instructions when flash is not executed or fails
+func displayFlashInstructions(st *buildapitypes.BuildResponse, isFailure bool) {
+	if st.Jumpstarter == nil || !st.Jumpstarter.Available {
+		return
+	}
+
+	// Only show instructions if this target actually has a mapping
+	// (i.e., there's a selector or flash command configured for it)
+	if st.Jumpstarter.ExporterSelector == "" && st.Jumpstarter.FlashCmd == "" {
+		return
+	}
+
+	// Don't show jumpstarter instructions if user requested a download - they have the artifact locally
+	if outputDir != "" {
+		return
+	}
+
+	colorsSupported := supportsColorOutput()
+
+	var headerColor, commandColor, infoColor func(...any) string
+	var headerPrefix, commandPrefix string
+
+	if isFailure {
+		if colorsSupported {
+			headerColor = color.New(color.FgHiRed, color.Bold).SprintFunc()
+			commandColor = color.New(color.FgHiYellow, color.Bold).SprintFunc()
+			infoColor = color.New(color.FgHiWhite).SprintFunc()
+		} else {
+			headerColor = func(a ...any) string { return fmt.Sprint(a...) }
+			commandColor = func(a ...any) string { return fmt.Sprint(a...) }
+			infoColor = func(a ...any) string { return fmt.Sprint(a...) }
+			headerPrefix = "[!] "
+			commandPrefix = ">> "
+		}
+	} else {
+		if colorsSupported {
+			// Success mode: use high-contrast, readable colors
+			headerColor = color.New(color.FgHiWhite, color.Bold).SprintFunc()
+			commandColor = color.New(color.FgHiGreen, color.Bold).SprintFunc()
+			infoColor = color.New(color.FgHiYellow).SprintFunc()
+		} else {
+			// Fallback with symbols for no-color terminals
+			headerColor = func(a ...any) string { return fmt.Sprint(a...) }
+			commandColor = func(a ...any) string { return fmt.Sprint(a...) }
+			infoColor = func(a ...any) string { return fmt.Sprint(a...) }
+			headerPrefix = "[*] "
+			commandPrefix = ">> "
+		}
+	}
+
+	if isFailure {
+		fmt.Printf("\n%s%s\n", headerPrefix, headerColor("Manual Flash Required"))
+		fmt.Printf("%s\n", infoColor("Flash failed, but you can flash manually using Jumpstarter:"))
+	} else {
+		fmt.Printf("%s\n", infoColor("Jumpstarter is available for flashing:"))
+	}
+
+	if st.Jumpstarter.ExporterSelector != "" {
+		fmt.Printf("  %s %s\n", infoColor("Exporter selector:"), st.Jumpstarter.ExporterSelector)
+	}
+
+	if st.Jumpstarter.FlashCmd != "" {
+		flashCmd := st.Jumpstarter.FlashCmd
+		imageURI := st.DiskImage
+		if imageURI == "" {
+			imageURI = st.ContainerImage
+		}
+		if imageURI != "" {
+			flashCmd = replaceFlashImagePlaceholders(flashCmd, imageURI)
+		}
+
+		if hasUnresolvedFlashImagePlaceholder(flashCmd) {
+			fmt.Printf("  %s\n", infoColor("Flash command template:"))
+			fmt.Printf("    %s%s\n", commandPrefix, commandColor(replaceFlashImagePlaceholders(flashCmd, "<image-uri>")))
+			fmt.Printf("  %s\n", infoColor("No pushed disk image URI is available for this build."))
+			fmt.Printf("  %s\n", infoColor("Use --push-disk <registry/repo:tag> or --internal-registry to produce a flashable URI."))
+			return
+		}
+
+		fmt.Printf("  %s\n", infoColor("Flash command:"))
+		fmt.Printf("    %s%s\n", commandPrefix, commandColor(flashCmd))
+	}
+}
+
+func handleFlashError(err error, st *buildapitypes.BuildResponse) {
+	fmt.Printf("Error: %v\n", err)
+
+	// Show flash instructions to help user flash manually after failure
+	if flashAfterBuild && st != nil {
+		displayFlashInstructions(st, true)
+	}
+
 	os.Exit(1)
 }
 
@@ -1678,7 +2317,7 @@ func isTarInsideGzip(filePath string) bool {
 func runList(_ *cobra.Command, _ []string) {
 	ctx := context.Background()
 	if strings.TrimSpace(serverURL) == "" {
-		fmt.Println("Error: --server is required (or set CAIB_SERVER)")
+		fmt.Println("Error: --server is required (or set CAIB_SERVER, or run 'caib login <server-url>')")
 		os.Exit(1)
 	}
 
@@ -1696,9 +2335,291 @@ func runList(_ *cobra.Command, _ []string) {
 		fmt.Println("No ImageBuilds found")
 		return
 	}
-	fmt.Printf("%-20s %-12s %-20s %-20s %-20s\n", "NAME", "STATUS", "MESSAGE", "CREATED", "ARTIFACT")
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	defer func() {
+		if err := w.Flush(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to flush output: %v\n", err)
+		}
+	}()
+
+	if _, err := fmt.Fprintln(w, "NAME\tSTATUS\tAGE\tREQUESTED BY\tARTIFACT"); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to write header: %v\n", err)
+		return
+	}
 	for _, it := range items {
-		fmt.Printf("%-20s %-12s %-20s %-20s %-20s\n", it.Name, it.Phase, it.Message, it.CreatedAt, "")
+		artifact := it.DiskImage
+		if artifact == "" {
+			artifact = it.ContainerImage
+		}
+		if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", it.Name, it.Phase, formatAge(it.CreatedAt), it.RequestedBy, artifact); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to write row: %v\n", err)
+		}
+	}
+}
+
+func runShow(_ *cobra.Command, args []string) {
+	ctx := context.Background()
+	showBuildName := args[0]
+
+	if strings.TrimSpace(serverURL) == "" {
+		handleError(fmt.Errorf("--server is required (or set CAIB_SERVER, or run 'caib login <server-url>')"))
+	}
+
+	var st *buildapitypes.BuildResponse
+	err := executeWithReauth(serverURL, &authToken, func(api *buildapiclient.Client) error {
+		var err error
+		st, err = api.GetBuild(ctx, showBuildName)
+		return err
+	})
+	if err != nil {
+		handleError(fmt.Errorf("error getting ImageBuild %s: %w", showBuildName, err))
+	}
+
+	// Backward-compatible fallback for older API servers that do not yet include response parameters.
+	if st.Parameters == nil {
+		_ = executeWithReauth(serverURL, &authToken, func(api *buildapiclient.Client) error {
+			tpl, err := api.GetBuildTemplate(ctx, showBuildName)
+			if err != nil {
+				return err
+			}
+			st.Parameters = buildParametersFromTemplate(tpl)
+			return nil
+		})
+	}
+
+	switch strings.ToLower(showOutputFormat) {
+	case "json":
+		out, err := json.MarshalIndent(st, "", "  ")
+		if err != nil {
+			handleError(fmt.Errorf("error rendering JSON output: %w", err))
+		}
+		fmt.Println(string(out))
+	case "yaml", "yml":
+		out, err := yaml.Marshal(st)
+		if err != nil {
+			handleError(fmt.Errorf("error rendering YAML output: %w", err))
+		}
+		fmt.Print(string(out))
+	case "table":
+		printBuildDetails(st)
+	default:
+		handleError(fmt.Errorf("invalid output format %q (supported: table, json, yaml)", showOutputFormat))
+	}
+}
+
+func buildParametersFromTemplate(tpl *buildapitypes.BuildTemplateResponse) *buildapitypes.BuildParameters {
+	if tpl == nil {
+		return nil
+	}
+
+	params := &buildapitypes.BuildParameters{
+		Architecture:           string(tpl.Architecture),
+		Distro:                 string(tpl.Distro),
+		Target:                 string(tpl.Target),
+		Mode:                   string(tpl.Mode),
+		ExportFormat:           string(tpl.ExportFormat),
+		Compression:            tpl.Compression,
+		StorageClass:           tpl.StorageClass,
+		AutomotiveImageBuilder: tpl.AutomotiveImageBuilder,
+		BuilderImage:           tpl.BuilderImage,
+		ContainerRef:           tpl.ContainerRef,
+		BuildDiskImage:         tpl.BuildDiskImage,
+		FlashEnabled:           tpl.FlashEnabled,
+		FlashLeaseDuration:     tpl.FlashLeaseDuration,
+		UseServiceAccountAuth:  tpl.UseInternalRegistry,
+	}
+
+	if strings.TrimSpace(params.Architecture) == "" &&
+		strings.TrimSpace(params.Distro) == "" &&
+		strings.TrimSpace(params.Target) == "" &&
+		strings.TrimSpace(params.Mode) == "" &&
+		strings.TrimSpace(params.ExportFormat) == "" &&
+		strings.TrimSpace(params.Compression) == "" &&
+		strings.TrimSpace(params.StorageClass) == "" &&
+		strings.TrimSpace(params.AutomotiveImageBuilder) == "" &&
+		strings.TrimSpace(params.BuilderImage) == "" &&
+		strings.TrimSpace(params.ContainerRef) == "" &&
+		strings.TrimSpace(params.FlashLeaseDuration) == "" &&
+		!params.BuildDiskImage &&
+		!params.FlashEnabled &&
+		!params.UseServiceAccountAuth {
+		return nil
+	}
+
+	return params
+}
+
+func printBuildDetails(st *buildapitypes.BuildResponse) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	defer func() {
+		if err := w.Flush(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to flush output: %v\n", err)
+		}
+	}()
+
+	rows := [][2]string{
+		{"Name", st.Name},
+		{"Phase", st.Phase},
+		{"Message", st.Message},
+		{"Requested By", valueOrDash(st.RequestedBy)},
+		{"Start Time", valueOrDash(st.StartTime)},
+		{"Completion Time", valueOrDash(st.CompletionTime)},
+		{"Container Image", valueOrDash(st.ContainerImage)},
+		{"Disk Image", valueOrDash(st.DiskImage)},
+		{"Warning", valueOrDash(st.Warning)},
+	}
+
+	if st.Parameters != nil {
+		rows = append(rows,
+			[2]string{"Architecture", valueOrDash(st.Parameters.Architecture)},
+			[2]string{"Distro", valueOrDash(st.Parameters.Distro)},
+			[2]string{"Target", valueOrDash(st.Parameters.Target)},
+			[2]string{"Mode", valueOrDash(st.Parameters.Mode)},
+			[2]string{"Export Format", valueOrDash(st.Parameters.ExportFormat)},
+			[2]string{"Compression", valueOrDash(st.Parameters.Compression)},
+			[2]string{"Storage Class", valueOrDash(st.Parameters.StorageClass)},
+			[2]string{"AIB Image", valueOrDash(st.Parameters.AutomotiveImageBuilder)},
+			[2]string{"Builder Image", valueOrDash(st.Parameters.BuilderImage)},
+		)
+	}
+
+	if st.Jumpstarter != nil {
+		rows = append(rows,
+			[2]string{"Jumpstarter Available", fmt.Sprintf("%t", st.Jumpstarter.Available)},
+			[2]string{"Jumpstarter Exporter", valueOrDash(st.Jumpstarter.ExporterSelector)},
+			[2]string{"Jumpstarter Flash Cmd", valueOrDash(st.Jumpstarter.FlashCmd)},
+			[2]string{"Jumpstarter Lease ID", valueOrDash(st.Jumpstarter.LeaseID)},
+		)
+	}
+
+	for _, row := range rows {
+		if _, err := fmt.Fprintf(w, "%s\t%s\n", row[0], row[1]); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to write output row: %v\n", err)
+			return
+		}
+	}
+}
+
+func runLogs(_ *cobra.Command, args []string) {
+	ctx := context.Background()
+	name := args[0]
+
+	if strings.TrimSpace(serverURL) == "" {
+		fmt.Println("Error: --server is required (or set CAIB_SERVER, or run 'caib login <server-url>')")
+		os.Exit(1)
+	}
+
+	api, err := createBuildAPIClient(serverURL, &authToken)
+	if err != nil {
+		handleError(err)
+	}
+
+	// Verify the build exists and show current status
+	st, err := api.GetBuild(ctx, name)
+	if err != nil {
+		handleError(fmt.Errorf("failed to get build: %w", err))
+	}
+	fmt.Printf("Build %s: %s - %s\n", name, st.Phase, st.Message)
+
+	if st.Phase == phaseCompleted || st.Phase == phaseFailed {
+		// Build is finished — attempt to fetch logs once (pods may have been GC'd)
+		logTransport := &http.Transport{
+			ResponseHeaderTimeout: 30 * time.Second,
+		}
+		if insecureSkipTLS {
+			logTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		}
+		logClient := &http.Client{
+			Timeout:   2 * time.Minute,
+			Transport: logTransport,
+		}
+		streamState := &logStreamState{}
+		if err := tryLogStreaming(ctx, logClient, name, streamState); err != nil {
+			fmt.Printf("Could not retrieve logs (pods may have been cleaned up). Use 'caib show %s' for details.\n", name)
+		}
+		return
+	}
+
+	followLogs = true
+	waitForBuildCompletion(ctx, api, name)
+	displayBuildResults(ctx, api, name)
+}
+
+func valueOrDash(v string) string {
+	if strings.TrimSpace(v) == "" {
+		return "-"
+	}
+	return v
+}
+
+func formatAge(rfcTime string) string {
+	t, err := time.Parse(time.RFC3339, rfcTime)
+	if err != nil {
+		return rfcTime
+	}
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	}
+}
+
+func runDownload(_ *cobra.Command, args []string) {
+	ctx := context.Background()
+	downloadBuildName := args[0]
+
+	if serverURL == "" {
+		handleError(fmt.Errorf("--server is required (or set CAIB_SERVER, or run 'caib login <server-url>')"))
+	}
+
+	if outputDir == "" {
+		handleError(fmt.Errorf("--output / -o is required"))
+	}
+
+	var st *buildapitypes.BuildResponse
+	err := executeWithReauth(serverURL, &authToken, func(api *buildapiclient.Client) error {
+		var err error
+		st, err = api.GetBuild(ctx, downloadBuildName)
+		return err
+	})
+	if err != nil {
+		handleError(fmt.Errorf("error getting build %s: %w", downloadBuildName, err))
+	}
+
+	if st.Phase != phaseCompleted {
+		handleError(fmt.Errorf("build %s is not completed (phase: %s), cannot download artifacts", downloadBuildName, st.Phase))
+	}
+
+	ociRef := st.DiskImage
+	if ociRef == "" {
+		handleError(fmt.Errorf("build %s has no disk image artifact to download (no OCI export was configured)", downloadBuildName))
+	}
+
+	// Use API-minted token if available (internal registry builds),
+	// otherwise fall back to environment credentials.
+	registryUsername := ""
+	registryPassword := ""
+	if st.RegistryToken != "" {
+		registryUsername = "serviceaccount"
+		registryPassword = st.RegistryToken
+	} else {
+		var effectiveRegistryURL string
+		effectiveRegistryURL, registryUsername, registryPassword = registryauth.ExtractRegistryCredentials(ociRef, "")
+		if err := registryauth.ValidateRegistryCredentials(effectiveRegistryURL, registryUsername, registryPassword); err != nil {
+			handleError(err)
+		}
+	}
+
+	fmt.Printf("Downloading disk image from %s\n", ociRef)
+	if err := pullOCIArtifact(ociRef, outputDir, registryUsername, registryPassword, insecureSkipTLS); err != nil {
+		handleError(fmt.Errorf("download failed: %w", err))
 	}
 }
 
@@ -1769,19 +2690,35 @@ func parseLeaseDuration(duration string) time.Duration {
 		return time.Hour // Default 1 hour
 	}
 	var hours, mins, secs int
-	_, _ = fmt.Sscanf(parts[0], "%d", &hours)
-	_, _ = fmt.Sscanf(parts[1], "%d", &mins)
-	_, _ = fmt.Sscanf(parts[2], "%d", &secs)
+
+	// Validate each part can be parsed as an integer
+	if n, err := fmt.Sscanf(parts[0], "%d", &hours); n != 1 || err != nil {
+		return time.Hour // Default 1 hour if hours is invalid
+	}
+	if n, err := fmt.Sscanf(parts[1], "%d", &mins); n != 1 || err != nil {
+		return time.Hour // Default 1 hour if minutes is invalid
+	}
+	if n, err := fmt.Sscanf(parts[2], "%d", &secs); n != 1 || err != nil {
+		return time.Hour // Default 1 hour if seconds is invalid
+	}
+
+	// Validate ranges to prevent negative or extremely large values
+	if hours < 0 || hours > 8760 || mins < 0 || mins >= 60 || secs < 0 || secs >= 60 {
+		return time.Hour // Default 1 hour if values are out of reasonable range
+	}
+
 	return time.Duration(hours)*time.Hour + time.Duration(mins)*time.Minute + time.Duration(secs)*time.Second
 }
 
 // runFlash handles the standalone 'flash' command
-func runFlash(_ *cobra.Command, args []string) {
+func runFlash(cmd *cobra.Command, args []string) {
+	applyWaitFollowDefaults(cmd, true, false)
+
 	ctx := context.Background()
 	imageRef := args[0]
 
 	if serverURL == "" {
-		handleError(fmt.Errorf("--server is required (or set CAIB_SERVER env)"))
+		handleError(fmt.Errorf("--server is required (or set CAIB_SERVER, or run 'caib login <server-url>')"))
 	}
 
 	if jumpstarterClient == "" {
@@ -1838,12 +2775,18 @@ func waitForFlashCompletion(ctx context.Context, api *buildapiclient.Client, nam
 	var lastPhase, lastMessage string
 	pendingWarningShown := false
 
+	flashLogTransport := &http.Transport{
+		ResponseHeaderTimeout: 30 * time.Second,
+		IdleConnTimeout:       2 * time.Minute,
+	}
+	if insecureSkipTLS {
+		flashLogTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	// No hard Timeout on the client: flash operations can stream logs for
+	// the entire lease duration (default 3 hours, user-configurable). The
+	// flash's context timeout (timeoutCtx) already governs cancellation.
 	logClient := &http.Client{
-		Timeout: 10 * time.Minute,
-		Transport: &http.Transport{
-			ResponseHeaderTimeout: 30 * time.Second,
-			IdleConnTimeout:       2 * time.Minute,
-		},
+		Transport: flashLogTransport,
 	}
 	streamState := &logStreamState{}
 
@@ -1870,7 +2813,7 @@ func waitForFlashCompletion(ctx context.Context, api *buildapiclient.Client, nam
 			}
 
 			// Handle terminal states
-			if st.Phase == "Completed" {
+			if st.Phase == phaseCompleted {
 				fmt.Println("Flash completed successfully!")
 				return
 			}
@@ -1883,7 +2826,7 @@ func waitForFlashCompletion(ctx context.Context, api *buildapiclient.Client, nam
 				continue
 			}
 
-			if st.Phase == "Pending" {
+			if st.Phase == phasePending {
 				streamState.reset()
 				if !pendingWarningShown {
 					fmt.Println("Waiting for flash to start before streaming logs...")
@@ -1892,7 +2835,7 @@ func waitForFlashCompletion(ctx context.Context, api *buildapiclient.Client, nam
 				continue
 			}
 
-			if st.Phase == "Running" {
+			if st.Phase == phaseRunning {
 				if streamState.retryCount == 0 {
 					fmt.Println("Flash is running. Attempting to stream logs...")
 					pendingWarningShown = false
@@ -1933,4 +2876,279 @@ func tryFlashLogStreaming(ctx context.Context, logClient *http.Client, name stri
 	}
 
 	return handleLogStreamError(resp, state)
+}
+
+// ── Sealed operations ──
+
+func sealedRegistryCredentials(refs ...string) (registryURL, username, password string) {
+	username = strings.TrimSpace(os.Getenv("REGISTRY_USERNAME"))
+	password = strings.TrimSpace(os.Getenv("REGISTRY_PASSWORD"))
+	if username == "" || password == "" {
+		return "", "", ""
+	}
+	for _, ref := range refs {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
+			continue
+		}
+		parts := strings.SplitN(ref, "/", 2)
+		if len(parts) < 2 {
+			return defaultRegistry, username, password
+		}
+		first := parts[0]
+		if strings.Contains(first, ".") || strings.Contains(first, ":") || first == "localhost" {
+			return first, username, password
+		}
+		return defaultRegistry, username, password
+	}
+	return "", "", ""
+}
+
+// sealedBuildRequest builds a SealedRequest from CLI flags
+func sealedBuildRequest(op buildapitypes.SealedOperation, inputRef, outputRef, signedRef string) (buildapitypes.SealedRequest, error) {
+	req := buildapitypes.SealedRequest{
+		Operation:    op,
+		InputRef:     inputRef,
+		OutputRef:    outputRef,
+		SignedRef:    signedRef,
+		AIBImage:     automotiveImageBuilder,
+		BuilderImage: sealedBuilderImage,
+		Architecture: sealedArchitecture,
+		AIBExtraArgs: aibExtraArgs,
+	}
+	if regURL, user, pass := sealedRegistryCredentials(inputRef, outputRef, signedRef); regURL != "" {
+		req.RegistryCredentials = &buildapitypes.RegistryCredentials{
+			Enabled:     true,
+			AuthType:    "username-password",
+			RegistryURL: regURL,
+			Username:    user,
+			Password:    pass,
+		}
+	}
+	if strings.TrimSpace(sealedKeyFile) != "" {
+		keyData, err := os.ReadFile(strings.TrimSpace(sealedKeyFile))
+		if err != nil {
+			return req, fmt.Errorf("failed to read key file %s: %w", sealedKeyFile, err)
+		}
+		req.KeyContent = string(keyData)
+		if strings.TrimSpace(sealedKeyPassword) != "" {
+			req.KeyPassword = strings.TrimSpace(sealedKeyPassword)
+		}
+	} else if strings.TrimSpace(sealedKeySecret) != "" {
+		req.KeySecretRef = strings.TrimSpace(sealedKeySecret)
+		if strings.TrimSpace(sealedKeyPasswordSecret) != "" {
+			req.KeyPasswordSecretRef = strings.TrimSpace(sealedKeyPasswordSecret)
+		}
+	}
+	return req, nil
+}
+
+// sealedRunViaAPI creates a sealed job via the Build API and optionally waits/streams logs
+func sealedRunViaAPI(op buildapitypes.SealedOperation, inputRef, outputRef, signedRef string) {
+	api, err := createBuildAPIClient(serverURL, &authToken)
+	if err != nil {
+		handleError(err)
+	}
+	ctx := context.Background()
+	req, err := sealedBuildRequest(op, inputRef, outputRef, signedRef)
+	if err != nil {
+		handleError(err)
+	}
+	resp, err := api.CreateSealed(ctx, req)
+	if err != nil {
+		handleError(err)
+	}
+	fmt.Printf("Job %s accepted: %s - %s\n", resp.Name, resp.Phase, resp.Message)
+	if waitForBuild || followLogs {
+		sealedWaitForCompletion(ctx, api, op, resp.Name)
+	}
+}
+
+const maxSealedLogRetries = 24
+
+func sealedWaitForCompletion(ctx context.Context, api *buildapiclient.Client, op buildapitypes.SealedOperation, name string) {
+	fmt.Println("Waiting for job to complete...")
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	sealedTimeout := time.Duration(timeout) * time.Minute
+	deadline := time.Now().Add(sealedTimeout)
+	var lastPhase string
+	logRetries := 0
+	logStreaming := false
+	logRetryWarningShown := false
+	for time.Now().Before(deadline) {
+		st, err := api.GetSealed(ctx, op, name)
+		if err != nil {
+			fmt.Printf("status check failed: %v\n", err)
+			<-ticker.C
+			continue
+		}
+		if st.Phase != lastPhase {
+			fmt.Printf("status: %s - %s\n", st.Phase, st.Message)
+			lastPhase = st.Phase
+		}
+		if st.Phase == phaseCompleted {
+			fmt.Println("Job completed successfully.")
+			if st.OutputRef != "" {
+				fmt.Printf("Output: %s\n", st.OutputRef)
+			}
+			return
+		}
+		if st.Phase == phaseFailed {
+			fmt.Printf("Error: job failed: %s\n", st.Message)
+			os.Exit(1)
+		}
+		if followLogs && !logStreaming && (st.Phase == phaseRunning || st.Phase == phasePending) {
+			if logRetries < maxSealedLogRetries {
+				sErr := sealedStreamLogs(op, name)
+				if sErr != nil {
+					logRetries++
+					if !logRetryWarningShown {
+						fmt.Printf("Waiting for logs... (attempt %d/%d)\n", logRetries, maxSealedLogRetries)
+						logRetryWarningShown = true
+					}
+				} else {
+					logStreaming = true
+				}
+			} else if !logRetryWarningShown {
+				fmt.Printf("Log streaming failed after %d attempts. Falling back to status updates.\n", maxSealedLogRetries)
+				logRetryWarningShown = true
+				followLogs = false
+			}
+		}
+		<-ticker.C
+	}
+	fmt.Printf("Error: timed out after %v\n", sealedTimeout)
+	os.Exit(1)
+}
+
+func sealedStreamLogs(op buildapitypes.SealedOperation, name string) error {
+	logURL := strings.TrimRight(serverURL, "/") + buildapitypes.SealedOperationAPIPath(op) + "/" + url.PathEscape(name) + "/logs?follow=1"
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, logURL, nil)
+	if t := strings.TrimSpace(authToken); t != "" {
+		req.Header.Set("Authorization", "Bearer "+t)
+	}
+	httpClient := &http.Client{Timeout: 10 * time.Minute}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("log stream failed: %w", err)
+	}
+	defer func() {
+		if cErr := resp.Body.Close(); cErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close response body: %v\n", cErr)
+		}
+	}()
+	if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout {
+		return fmt.Errorf("log endpoint not ready (HTTP %d)", resp.StatusCode)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("log stream error: HTTP %d", resp.StatusCode)
+	}
+	fmt.Println("Streaming logs...")
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		fmt.Println(scanner.Text())
+	}
+	_ = scanner.Err()
+	return nil
+}
+
+// ── Sealed command runners ──
+
+// resolveSealedTwoRefs returns input and output refs from --input/--output flags or positionals (any order).
+func resolveSealedTwoRefs(args []string) (inputRef, outputRef string, err error) {
+	in := strings.TrimSpace(sealedInputRef)
+	out := strings.TrimSpace(sealedOutputRef)
+	if in != "" && out != "" {
+		return in, out, nil
+	}
+	if in != "" && len(args) >= 1 {
+		return in, strings.TrimSpace(args[0]), nil
+	}
+	if out != "" && len(args) >= 1 {
+		return strings.TrimSpace(args[0]), out, nil
+	}
+	if len(args) >= 2 {
+		return strings.TrimSpace(args[0]), strings.TrimSpace(args[1]), nil
+	}
+	return "", "", fmt.Errorf("need two refs: use positionals (source output) or --input and --output in any order")
+}
+
+// resolveSealedThreeRefs returns input, signed, and output refs from --input/--signed/--output flags or positionals (any order).
+func resolveSealedThreeRefs(args []string) (inputRef, signedRef, outputRef string, err error) {
+	in := strings.TrimSpace(sealedInputRef)
+	signed := strings.TrimSpace(sealedSignedRef)
+	out := strings.TrimSpace(sealedOutputRef)
+	if in != "" && signed != "" && out != "" {
+		return in, signed, out, nil
+	}
+	// Count how many from flags; remaining from args in order: input, signed, output
+	fromFlags := 0
+	if in != "" {
+		fromFlags++
+	}
+	if signed != "" {
+		fromFlags++
+	}
+	if out != "" {
+		fromFlags++
+	}
+	need := 3 - fromFlags
+	if len(args) < need {
+		return "", "", "", fmt.Errorf("need three refs (source, signed-artifact, output): use positionals or --input, --signed, --output in any order")
+	}
+	idx := 0
+	if in == "" {
+		in = strings.TrimSpace(args[idx])
+		idx++
+	}
+	if signed == "" {
+		signed = strings.TrimSpace(args[idx])
+		idx++
+	}
+	if out == "" {
+		out = strings.TrimSpace(args[idx])
+	}
+	return in, signed, out, nil
+}
+
+func runPrepareReseal(cmd *cobra.Command, args []string) {
+	applyWaitFollowDefaults(cmd, false, true)
+
+	inputRef, outputRef, err := resolveSealedTwoRefs(args)
+	if err != nil {
+		handleError(err)
+	}
+	sealedRunViaAPI(buildapitypes.SealedPrepareReseal, inputRef, outputRef, "")
+}
+
+func runReseal(cmd *cobra.Command, args []string) {
+	applyWaitFollowDefaults(cmd, false, true)
+
+	inputRef, outputRef, err := resolveSealedTwoRefs(args)
+	if err != nil {
+		handleError(err)
+	}
+	sealedRunViaAPI(buildapitypes.SealedReseal, inputRef, outputRef, "")
+}
+
+func runExtractForSigning(cmd *cobra.Command, args []string) {
+	applyWaitFollowDefaults(cmd, false, true)
+
+	inputRef, outputRef, err := resolveSealedTwoRefs(args)
+	if err != nil {
+		handleError(err)
+	}
+	sealedRunViaAPI(buildapitypes.SealedExtractForSigning, inputRef, outputRef, "")
+}
+
+func runInjectSigned(cmd *cobra.Command, args []string) {
+	applyWaitFollowDefaults(cmd, false, true)
+
+	inputRef, signedRef, outputRef, err := resolveSealedThreeRefs(args)
+	if err != nil {
+		handleError(err)
+	}
+	sealedRunViaAPI(buildapitypes.SealedInjectSigned, inputRef, outputRef, signedRef)
 }

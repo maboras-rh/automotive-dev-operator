@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/config"
 	"github.com/spf13/cobra"
 )
 
@@ -50,15 +51,15 @@ type verifyResponse struct {
 	Triggered bool   `json:"triggered"`
 }
 
-func runVerify(_ *cobra.Command, args []string) error {
+func runVerify(cmd *cobra.Command, args []string) error {
 	name := args[0]
 
 	server := serverURL
 	if server == "" {
-		server = os.Getenv("CAIB_SERVER")
+		server = config.DefaultServer()
 	}
 	if server == "" {
-		return fmt.Errorf("server URL required (use --server or CAIB_SERVER env var)")
+		return fmt.Errorf("server URL required (use --server, CAIB_SERVER, or run 'caib login <server-url>')")
 	}
 
 	token := authToken
@@ -83,7 +84,7 @@ func runVerify(_ *cobra.Command, args []string) error {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	client := &http.Client{}
+	client := newHTTPClient(getInsecureSkipTLS(cmd))
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to make request: %w", err)

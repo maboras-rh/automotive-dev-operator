@@ -24,6 +24,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/config"
 	"github.com/spf13/cobra"
 )
 
@@ -46,15 +47,15 @@ func newRemoveCmd() *cobra.Command {
 	return cmd
 }
 
-func runRemove(_ *cobra.Command, args []string) error {
+func runRemove(cmd *cobra.Command, args []string) error {
 	name := args[0]
 
 	server := serverURL
 	if server == "" {
-		server = os.Getenv("CAIB_SERVER")
+		server = config.DefaultServer()
 	}
 	if server == "" {
-		return fmt.Errorf("server URL required (use --server or CAIB_SERVER env var)")
+		return fmt.Errorf("server URL required (use --server, CAIB_SERVER, or run 'caib login <server-url>')")
 	}
 
 	token := authToken
@@ -90,7 +91,7 @@ func runRemove(_ *cobra.Command, args []string) error {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	client := &http.Client{}
+	client := newHTTPClient(getInsecureSkipTLS(cmd))
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to make request: %w", err)

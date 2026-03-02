@@ -81,39 +81,7 @@ oc apply -f config/samples/automotive_v1_operatorconfig.yaml
 
 ### Creating Your First Build
 
-1. **Create a ConfigMap with your AIB manifest:**
-
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: my-build-manifest
-data:
-  simple.aib.yml: |
-    name: container
-
-    content:
-      rpms:
-        - openssh-server
-      systemd:
-        enabled_services:
-          - sshd.service
-      add_files:
-         - path: /usr/share/hello.txt
-           text: |
-             hello!
-    image:
-      image_size: 8 GiB
-
-    auth:
-      # "password"
-      root_password: $6$xoLqEUz0cGGJRx01$H3H/bFm0myJPULNMtbSsOFd/2BnHqHkMD92Sfxd.EKM9hXTWSmELG8cf205l6dktomuTcgKGGtGDgtvHVXSWU.
-      sshd_config:
-        PermitRootLogin: true
-        PasswordAuthentication: true
-```
-
-2. **Create an ImageBuild resource:**
+1. **Create an ImageBuild resource with an inline AIB manifest:**
 
 ```yaml
 apiVersion: automotive.sdv.cloud.redhat.com/v1alpha1
@@ -121,22 +89,46 @@ kind: ImageBuild
 metadata:
   name: my-automotive-image
 spec:
-  distro: autosd
   architecture: amd64
-  mode: image
-  target: qemu
-  exportFormat: qcow2
-  manifestConfigMap: my-build-manifest
+  aib:
+    distro: autosd
+    target: qemu
+    mode: image
+    manifest: |
+      name: container
+
+      content:
+        rpms:
+          - openssh-server
+        systemd:
+          enabled_services:
+            - sshd.service
+        add_files:
+           - path: /usr/share/hello.txt
+             text: |
+               hello!
+      image:
+        image_size: 8 GiB
+
+      auth:
+        # "password"
+        root_password: $6$xoLqEUz0cGGJRx01$H3H/bFm0myJPULNMtbSsOFd/2BnHqHkMD92Sfxd.EKM9hXTWSmELG8cf205l6dktomuTcgKGGtGDgtvHVXSWU.
+        sshd_config:
+          PermitRootLogin: true
+          PasswordAuthentication: true
+    manifestFileName: "simple.aib.yml"
+  export:
+    format: qcow2
+    compression: gzip
 ```
 
-3. **Apply the resources:**
+2. **Apply the resource:**
 
 ```sh
-oc apply -f manifest-configmap.yaml
 oc apply -f imagebuild.yaml
 ```
 
-4. **Monitor the build:**
+3. **Monitor the build:**
 
 ```sh
 oc get imagebuild my-automotive-image -w

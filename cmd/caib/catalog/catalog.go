@@ -17,6 +17,12 @@ limitations under the License.
 package catalog
 
 import (
+	"crypto/tls"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+
 	"github.com/spf13/cobra"
 )
 
@@ -56,4 +62,44 @@ func addCommonFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&authToken, "token", "", "Bearer token for authentication (env: CAIB_TOKEN)")
 	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Kubernetes namespace")
 	cmd.Flags().StringVarP(&outputFormat, "output", "o", "table", "Output format (table, json, yaml)")
+}
+
+// getInsecureSkipTLS returns whether to skip TLS verification
+// Checks the --insecure flag from the root command or CAIB_INSECURE env var
+func getInsecureSkipTLS(cmd *cobra.Command) bool {
+	// Try to get from root command's persistent flag
+	if cmd.Root() != nil {
+		if flag := cmd.Root().PersistentFlags().Lookup("insecure"); flag != nil {
+			if val, err := strconv.ParseBool(flag.Value.String()); err == nil {
+				return val
+			}
+		}
+	}
+	// Fall back to env var
+	return envBool("CAIB_INSECURE")
+}
+
+// envBool parses a boolean from environment variable
+func envBool(key string) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return false
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false
+	}
+	return b
+}
+
+// newHTTPClient creates an HTTP client with optional insecure TLS
+func newHTTPClient(insecureSkipTLS bool) *http.Client {
+	if insecureSkipTLS {
+		return &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}
+	}
+	return &http.Client{}
 }

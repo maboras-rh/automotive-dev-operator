@@ -43,12 +43,12 @@ var _ = Describe("GetOIDCConfigFromAPI", func() {
 			_ = json.NewEncoder(w).Encode(response)
 		}))
 
-		config, err := GetOIDCConfigFromAPI(server.URL)
+		config, err := GetOIDCConfigFromAPI(server.URL, false)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(config).NotTo(BeNil())
 		Expect(config.IssuerURL).To(Equal("https://issuer.example.com"))
 		Expect(config.ClientID).To(Equal("test-client"))
-		Expect(config.Scopes).To(Equal([]string{"openid", "profile", "email"}))
+		Expect(config.Scopes).To(Equal([]string{"openid", "profile", "email", "offline_access"}))
 	})
 
 	It("should return nil config without error when API returns 404", func() {
@@ -56,7 +56,7 @@ var _ = Describe("GetOIDCConfigFromAPI", func() {
 			w.WriteHeader(http.StatusNotFound)
 		}))
 
-		config, err := GetOIDCConfigFromAPI(server.URL)
+		config, err := GetOIDCConfigFromAPI(server.URL, false)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(config).To(BeNil())
 	})
@@ -66,7 +66,7 @@ var _ = Describe("GetOIDCConfigFromAPI", func() {
 			w.WriteHeader(http.StatusInternalServerError)
 		}))
 
-		config, err := GetOIDCConfigFromAPI(server.URL)
+		config, err := GetOIDCConfigFromAPI(server.URL, false)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("HTTP 500"))
 		Expect(config).To(BeNil())
@@ -82,7 +82,7 @@ var _ = Describe("GetOIDCConfigFromAPI", func() {
 			_ = json.NewEncoder(w).Encode(response)
 		}))
 
-		config, err := GetOIDCConfigFromAPI(server.URL)
+		config, err := GetOIDCConfigFromAPI(server.URL, false)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(config).To(BeNil())
 	})
@@ -103,14 +103,14 @@ var _ = Describe("GetOIDCConfigFromAPI", func() {
 			_ = json.NewEncoder(w).Encode(response)
 		}))
 
-		config, err := GetOIDCConfigFromAPI(server.URL)
+		config, err := GetOIDCConfigFromAPI(server.URL, false)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("client ID is required"))
 		Expect(config).To(BeNil())
 	})
 
 	It("should return error when network request fails", func() {
-		config, err := GetOIDCConfigFromAPI("http://invalid-host-that-does-not-exist:9999")
+		config, err := GetOIDCConfigFromAPI("http://invalid-host-that-does-not-exist:9999", false)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("failed to fetch OIDC config from API"))
 		Expect(config).To(BeNil())
@@ -122,7 +122,7 @@ var _ = Describe("GetOIDCConfigFromAPI", func() {
 			_, _ = w.Write([]byte("invalid json"))
 		}))
 
-		config, err := GetOIDCConfigFromAPI(server.URL)
+		config, err := GetOIDCConfigFromAPI(server.URL, false)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("failed to decode"))
 		Expect(config).To(BeNil())

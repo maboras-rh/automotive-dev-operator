@@ -8,21 +8,21 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: ado-manager-role
+  name: manager-role
 subjects:
 - kind: ServiceAccount
-  name: ado-controller-manager
-  namespace: automotive-dev-operator-system
+  name: operator
+  namespace: system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: ado-controller-manager-auth-delegator
+  name: operator-auth-delegator
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: system:auth-delegator
 subjects:
 - kind: ServiceAccount
-  name: ado-controller-manager
-  namespace: automotive-dev-operator-system
+  name: operator
+  namespace: system

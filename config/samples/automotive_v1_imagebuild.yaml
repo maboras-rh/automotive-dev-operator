@@ -21,7 +21,11 @@ spec:
     distro: "autosd"           # required: distribution to build
     target: "qemu"          # required: target platform
     mode: "image"           # package, image, bootc, disk
-    manifestConfigMap: mpp  # required: ConfigMap with AIB manifest
+    manifest: |
+      # Sample AIB manifest
+      # Replace with actual manifest content
+      name: sample-build
+    manifestFileName: "sample.aib.yml"
     image: "quay.io/centos-sig-automotive/automotive-image-builder:1.0.0"
     #builderImage: ""       # optional: custom osbuild builder
     #inputFilesServer: false # optional: enable file upload server

@@ -1,0 +1,10 @@
+reviews:
+  path_filters:
+    - "!vendor/**"
+    - "!**zz_generated*"
+    - "!config/crd/bases/**"
+    - "!config/rbac/role.yaml"
+    - "!bundle/**"
+    - "!catalog/**"
+    - "!bin/**"
+    - "!**go.sum"

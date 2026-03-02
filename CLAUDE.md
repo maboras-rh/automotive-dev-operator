@@ -11,7 +11,6 @@ make build                    # Builds manager and init-secrets binaries
 # Build specific components
 make build-caib               # Build CLI tool
 make build-api-server         # Build API server
-go build -o bin/manager cmd/main.go
 
 # Run tests
 make test                     # Run unit tests with coverage
@@ -29,10 +28,17 @@ make manifests                # Generate CRDs, RBAC, webhooks
 go run ./cmd/main.go          # Run controller locally
 go run ./cmd/build-api/ --kubeconfig-path ~/.kube/config  # Run API server locally
 
-# Kubernetes deployment (preferred method)
-./hack/deploy-catalog.sh --uninstall --install  # Redeploy operator (use this for testing changes)
+# Kubernetes deployment via OLM catalog (preferred method)
+# IMPORTANT: Before running deploy-catalog.sh (redeploy or uninstall), you MUST:
+#   1. Run: oc whoami --show-server && oc whoami
+#   2. Show the cluster URL and user to the user
+#   3. Ask the user to confirm this is the correct cluster
+#   4. Only proceed with -y flag after user confirms
+./hack/deploy-catalog.sh -y           # Full redeploy: uninstall, build, install
+./hack/deploy-catalog.sh uninstall -y # Uninstall the operator only
+./hack/deploy-catalog.sh build        # Build and push images only (no install, no confirmation needed)
 
-# Alternative deployment
+# Alternative deployment (without OLM)
 make install                  # Install CRDs
 make deploy IMG=<registry>/automotive-dev-operator:tag
 make undeploy
@@ -72,8 +78,6 @@ This is a Kubernetes operator for automotive OS image building, built with Kubeb
 - To edit Tekton Tasks/Pipelines without the operator overwriting changes, annotate with `automotive.sdv.cloud.redhat.com/unmanaged=true`. See DEVELOPMENT.md for details.
 
 ## Active Technologies
-- Go 1.22+ (consistent with existing operator codebase) + Kubebuilder, controller-runtime, Kubernetes client-go, container registry client libraries (001-image-catalog)
-- Kubernetes etcd (via Custom Resources), container registries for image artifacts (001-image-catalog)
-
-## Recent Changes
-- 001-image-catalog: Added Go 1.22+ (consistent with existing operator codebase) + Kubebuilder, controller-runtime, Kubernetes client-go, container registry client libraries
+- Go 1.22+, Kubebuilder, controller-runtime, Kubernetes client-go
+- Tekton Pipelines for build execution
+- Container registries for image artifacts

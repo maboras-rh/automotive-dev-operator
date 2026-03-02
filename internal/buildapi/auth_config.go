@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"reflect"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -29,6 +30,62 @@ type AuthenticationConfiguration struct {
 // InternalAuthConfig defines internal authentication configuration.
 type InternalAuthConfig struct {
 	Prefix string `json:"prefix"`
+}
+
+// jwtConfigsEqual compares two JWT authenticator slices to check if they're effectively equal.
+// This is used to determine if we need to recreate the OIDC authenticator.
+func jwtConfigsEqual(a, b []apiserverv1beta1.JWTAuthenticator) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		// Compare key fields that would affect authentication
+		if a[i].Issuer.URL != b[i].Issuer.URL {
+			return false
+		}
+		if a[i].Issuer.CertificateAuthority != b[i].Issuer.CertificateAuthority {
+			return false
+		}
+		if !reflect.DeepEqual(a[i].Issuer.Audiences, b[i].Issuer.Audiences) {
+			return false
+		}
+		if a[i].ClaimMappings.Username.Claim != b[i].ClaimMappings.Username.Claim {
+			return false
+		}
+		if a[i].ClaimMappings.Groups.Claim != b[i].ClaimMappings.Groups.Claim {
+			return false
+		}
+		// Compare prefixes
+		aUsernamePrefix := ""
+		bUsernamePrefix := ""
+		if a[i].ClaimMappings.Username.Prefix != nil {
+			aUsernamePrefix = *a[i].ClaimMappings.Username.Prefix
+		}
+		if b[i].ClaimMappings.Username.Prefix != nil {
+			bUsernamePrefix = *b[i].ClaimMappings.Username.Prefix
+		}
+		if aUsernamePrefix != bUsernamePrefix {
+			return false
+		}
+	}
+	return true
+}
+
+// authConfigsEqual compares two authentication configurations to check if they're effectively equal.
+func authConfigsEqual(a, b *AuthenticationConfiguration) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	if a.ClientID != b.ClientID {
+		return false
+	}
+	if a.Internal.Prefix != b.Internal.Prefix {
+		return false
+	}
+	return jwtConfigsEqual(a.JWT, b.JWT)
 }
 
 func newJWTAuthenticator(ctx context.Context, config AuthenticationConfiguration) (authenticator.Token, error) {

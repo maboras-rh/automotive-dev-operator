@@ -4,6 +4,8 @@ package operatorconfig
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -12,8 +14,11 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -24,35 +29,95 @@ import (
 )
 
 const (
-	operatorNamespace     = "automotive-dev-operator-system"
-	finalizerName         = "operatorconfig.automotive.sdv.cloud.redhat.com/finalizer"
-	buildAPIName          = "ado-build-api"
-	phaseFailed           = "Failed"
-	internalJWTSecretName = "ado-build-api-internal-jwt"
+	finalizerName           = "operatorconfig.automotive.sdv.cloud.redhat.com/finalizer"
+	buildAPIName            = "ado-build-api"
+	phaseFailed             = "Failed"
+	internalJWTSecretName   = "ado-build-api-internal-jwt"
+	unmanagedAnnotationKey  = "automotive.sdv.cloud.redhat.com/unmanaged"
+	unmanagedAnnotationTrue = "true"
 )
+
+// targetDefaultsYAML is the default content for the aib-target-defaults ConfigMap.
+// It defines per-target build defaults (architecture, extra args, partition rules).
+var targetDefaultsYAML = `targets:
+  ridesx4:
+    architecture: arm64
+    extraArgs: ["--separate-partitions"]
+    include: ["system_a", "system_b", "boot_a", "boot_b"]
+  ridesx4_r3:
+    architecture: arm64
+    extraArgs: ["--separate-partitions"]
+    include: ["system_a", "system_b", "boot_a", "boot_b"]
+  ridesx4_scmi:
+    architecture: arm64
+    extraArgs: ["--separate-partitions"]
+    include: ["system_a", "system_b", "boot_a", "boot_b"]
+  ride4_sa8775p_sx_r3:
+    architecture: arm64
+    extraArgs: ["--separate-partitions"]
+    include: ["system_a", "system_b", "boot_a", "boot_b"]
+  ride4_sa8775p_sx:
+    architecture: arm64
+    extraArgs: ["--separate-partitions"]
+    include: ["system_a", "system_b", "boot_a", "boot_b"]
+  ride4_sa8775p_sx_legacy:
+    architecture: arm64
+    extraArgs: ["--separate-partitions"]
+    include: ["system_a", "system_b", "boot_a", "boot_b"]
+  ride4_sa8775p_sx_legacy_r3:
+    architecture: arm64
+    extraArgs: ["--separate-partitions"]
+    include: ["system_a", "system_b", "boot_a", "boot_b"]
+  ride4_sa8650p_sx_r3:
+    architecture: arm64
+    extraArgs: ["--separate-partitions"]
+    include: ["system_a", "system_b", "boot_a", "boot_b"]
+  ebbr:
+    architecture: arm64
+  rcar_s4:
+    architecture: arm64
+  j784s4evm:
+    architecture: arm64
+  s32g_vnp_rdb3:
+    architecture: arm64
+`
 
 // isNoMatchError checks if error is "no matches for kind" error (CRD doesn't exist)
 func isNoMatchError(err error) bool {
 	if err == nil {
 		return false
 	}
-	errMsg := err.Error()
-	return errMsg == "no matches for kind \"Route\" in version \"route.openshift.io/v1\"" ||
-		errMsg == "no matches for kind \"Ingress\" in version \"networking.k8s.io/v1\""
+	if apimeta.IsNoMatchError(err) {
+		return true
+	}
+	errMsg := strings.ToLower(err.Error())
+	return strings.Contains(errMsg, "no matches for kind \"route\"") ||
+		strings.Contains(errMsg, "no matches for kind \"ingress\"")
 }
 
-// detectOpenShift checks if we're running on OpenShift by looking for OpenShift-specific APIs
-func (r *OperatorConfigReconciler) detectOpenShift(ctx context.Context) bool {
+// detectOpenShift checks if we're running on OpenShift by looking for OpenShift-specific APIs.
+// The probe uses the reconciled namespace so it works with namespace-scoped caches.
+func (r *OperatorConfigReconciler) detectOpenShift(ctx context.Context, namespace string) bool {
 	if r.IsOpenShift != nil {
 		return *r.IsOpenShift
+	}
+	if namespace == "" {
+		namespace = "default"
 	}
 
 	route := &routev1.Route{}
 	route.Name = "test"
-	route.Namespace = "default"
-	err := r.Get(ctx, client.ObjectKey{Name: "test", Namespace: "default"}, route)
+	route.Namespace = namespace
+	err := r.Get(ctx, client.ObjectKey{Name: "test", Namespace: namespace}, route)
 
-	isOpenShift := !isNoMatchError(err)
+	// Route API exists on OpenShift; probing a dummy object should return NotFound there.
+	// Any ambiguous error is treated as non-OpenShift to avoid creating OpenShift-only resources on Kubernetes.
+	isOpenShift := err == nil || errors.IsNotFound(err)
+	if err != nil && !errors.IsNotFound(err) && !isNoMatchError(err) {
+		r.Log.Error(err, "OpenShift detection probe failed unexpectedly, defaulting to non-OpenShift")
+		isOpenShift = false
+	}
+
 	r.IsOpenShift = &isOpenShift
 	r.Log.Info("Platform detected", "isOpenShift", isOpenShift)
 	return isOpenShift
@@ -108,7 +173,8 @@ type OperatorConfigReconciler struct {
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings;clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=tekton.dev,resources=tasks;pipelines;pipelineruns,verbs=get;list;watch;create;update;patch;delete
@@ -144,7 +210,7 @@ func (r *OperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// Handle deletion
 	if !config.DeletionTimestamp.IsZero() {
 		log.Info("Handling deletion")
-		if err := r.cleanupOSBuilds(ctx); err != nil {
+		if err := r.cleanupOSBuilds(ctx, config); err != nil {
 			log.Error(err, "Failed to cleanup OSBuilds")
 			return ctrl.Result{}, err
 		}
@@ -183,7 +249,7 @@ func (r *OperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			statusChanged = true
 		}
 	} else {
-		if err := r.cleanupOSBuilds(ctx); err != nil {
+		if err := r.cleanupOSBuilds(ctx, config); err != nil {
 			log.Error(err, "Failed to cleanup OSBuilds")
 			if config.Status.Phase != phaseFailed {
 				config.Status.Phase = phaseFailed
@@ -240,16 +306,16 @@ func (r *OperatorConfigReconciler) deployBuildAPI(ctx context.Context, owner *au
 	r.Log.Info("Build API will read authentication config directly from OperatorConfig")
 
 	// Update ServiceAccount with build-api OAuth redirect annotation
-	if err := r.updateBuildAPIServiceAccountAnnotation(ctx); err != nil {
+	if err := r.updateBuildAPIServiceAccountAnnotation(ctx, owner); err != nil {
 		r.Log.Error(err, "Failed to update ServiceAccount build-api OAuth annotation")
 		return fmt.Errorf("failed to update ServiceAccount build-api OAuth annotation: %w", err)
 	}
 
-	isOpenShift := r.detectOpenShift(ctx)
+	isOpenShift := r.detectOpenShift(ctx, owner.Namespace)
 
 	// Create/update build-api deployment
 	r.Log.Info("Creating/updating build-api deployment")
-	buildAPIDeployment := r.buildBuildAPIDeployment(isOpenShift)
+	buildAPIDeployment := r.buildBuildAPIDeployment(owner.Namespace, isOpenShift, owner)
 	if err := r.createOrUpdate(ctx, buildAPIDeployment, owner); err != nil {
 		r.Log.Error(err, "Failed to create/update build-api deployment")
 		return fmt.Errorf("failed to create/update build-api deployment: %w", err)
@@ -258,7 +324,7 @@ func (r *OperatorConfigReconciler) deployBuildAPI(ctx context.Context, owner *au
 
 	// Create/update build-api service
 	r.Log.Info("Creating/updating build-api service")
-	buildAPIService := r.buildBuildAPIService(isOpenShift)
+	buildAPIService := r.buildBuildAPIService(owner.Namespace, isOpenShift)
 	if err := r.createOrUpdate(ctx, buildAPIService, owner); err != nil {
 		r.Log.Error(err, "Failed to create/update build-api service")
 		return fmt.Errorf("failed to create/update build-api service: %w", err)
@@ -267,7 +333,7 @@ func (r *OperatorConfigReconciler) deployBuildAPI(ctx context.Context, owner *au
 
 	// Create/update build-api route (OpenShift)
 	r.Log.Info("Creating/updating build-api route")
-	buildAPIRoute := r.buildBuildAPIRoute()
+	buildAPIRoute := r.buildBuildAPIRoute(owner.Namespace, owner)
 	if err := r.createOrUpdate(ctx, buildAPIRoute, owner); err != nil {
 		r.Log.Error(err, "Failed to create/update build-api route (this is expected on non-OpenShift clusters)")
 	} else {
@@ -276,7 +342,7 @@ func (r *OperatorConfigReconciler) deployBuildAPI(ctx context.Context, owner *au
 
 	// Create/update build-api ingress (Kubernetes)
 	r.Log.Info("Creating/updating build-api ingress")
-	buildAPIIngress := r.buildBuildAPIIngress()
+	buildAPIIngress := r.buildBuildAPIIngress(owner.Namespace)
 	if err := r.createOrUpdate(ctx, buildAPIIngress, owner); err != nil {
 		r.Log.Error(err,
 			"Failed to create/update build-api ingress (expected if ingress controller is not installed)")
@@ -290,18 +356,18 @@ func (r *OperatorConfigReconciler) deployBuildAPI(ctx context.Context, owner *au
 
 func (r *OperatorConfigReconciler) ensureBuildAPIOAuthSecret(
 	ctx context.Context,
-	_ *automotivev1alpha1.OperatorConfig,
+	owner *automotivev1alpha1.OperatorConfig,
 ) error {
 	secretName := "ado-build-api-oauth-proxy"
 	secret := &corev1.Secret{}
-	err := r.Get(ctx, client.ObjectKey{Name: secretName, Namespace: operatorNamespace}, secret)
+	err := r.Get(ctx, client.ObjectKey{Name: secretName, Namespace: owner.Namespace}, secret)
 
 	if err != nil {
 		if !errors.IsNotFound(err) {
 			return fmt.Errorf("failed to get secret %s: %w", secretName, err)
 		}
 		// Secret doesn't exist, create it
-		secret = r.buildOAuthSecret(secretName)
+		secret = r.buildOAuthSecret(secretName, owner.Namespace)
 		if err := r.Create(ctx, secret); err != nil {
 			return fmt.Errorf("failed to create secret %s: %w", secretName, err)
 		}
@@ -310,9 +376,9 @@ func (r *OperatorConfigReconciler) ensureBuildAPIOAuthSecret(
 	return nil
 }
 
-func (r *OperatorConfigReconciler) updateBuildAPIServiceAccountAnnotation(ctx context.Context) error {
+func (r *OperatorConfigReconciler) updateBuildAPIServiceAccountAnnotation(ctx context.Context, owner *automotivev1alpha1.OperatorConfig) error {
 	sa := &corev1.ServiceAccount{}
-	if err := r.Get(ctx, client.ObjectKey{Name: "ado-controller-manager", Namespace: operatorNamespace}, sa); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Name: "ado-operator", Namespace: owner.Namespace}, sa); err != nil {
 		return fmt.Errorf("failed to get service account: %w", err)
 	}
 
@@ -335,11 +401,11 @@ func (r *OperatorConfigReconciler) updateBuildAPIServiceAccountAnnotation(ctx co
 	return nil
 }
 
-func (r *OperatorConfigReconciler) cleanupBuildAPI(ctx context.Context) error {
+func (r *OperatorConfigReconciler) cleanupBuildAPI(ctx context.Context, config *automotivev1alpha1.OperatorConfig) error {
 	// Delete build-api deployment
 	deployment := &appsv1.Deployment{}
 	deployment.Name = buildAPIName
-	deployment.Namespace = operatorNamespace
+	deployment.Namespace = config.Namespace
 	if err := r.Delete(ctx, deployment); err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete build-api deployment: %w", err)
 	}
@@ -347,7 +413,7 @@ func (r *OperatorConfigReconciler) cleanupBuildAPI(ctx context.Context) error {
 	// Delete build-api service
 	service := &corev1.Service{}
 	service.Name = buildAPIName
-	service.Namespace = operatorNamespace
+	service.Namespace = config.Namespace
 	if err := r.Delete(ctx, service); err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete build-api service: %w", err)
 	}
@@ -355,7 +421,7 @@ func (r *OperatorConfigReconciler) cleanupBuildAPI(ctx context.Context) error {
 	// Delete build-api route (OpenShift only)
 	route := &routev1.Route{}
 	route.Name = buildAPIName
-	route.Namespace = operatorNamespace
+	route.Namespace = config.Namespace
 	if err := r.Delete(ctx, route); err != nil && !errors.IsNotFound(err) && !isNoMatchError(err) {
 		r.Log.Error(err, "Failed to delete build-api route (ignoring, expected on non-OpenShift clusters)")
 	}
@@ -363,7 +429,7 @@ func (r *OperatorConfigReconciler) cleanupBuildAPI(ctx context.Context) error {
 	// Delete build-api ingress
 	ingress := &networkingv1.Ingress{}
 	ingress.Name = buildAPIName
-	ingress.Namespace = operatorNamespace
+	ingress.Namespace = config.Namespace
 	if err := r.Delete(ctx, ingress); err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete build-api ingress: %w", err)
 	}
@@ -371,7 +437,7 @@ func (r *OperatorConfigReconciler) cleanupBuildAPI(ctx context.Context) error {
 	// Delete build-api OAuth secret
 	secret := &corev1.Secret{}
 	secret.Name = "ado-build-api-oauth-proxy"
-	secret.Namespace = operatorNamespace
+	secret.Namespace = config.Namespace
 	if err := r.Delete(ctx, secret); err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete build-api OAuth secret: %w", err)
 	}
@@ -379,7 +445,7 @@ func (r *OperatorConfigReconciler) cleanupBuildAPI(ctx context.Context) error {
 	// Delete build-api internal JWT secret
 	jwtSecret := &corev1.Secret{}
 	jwtSecret.Name = internalJWTSecretName
-	jwtSecret.Namespace = operatorNamespace
+	jwtSecret.Namespace = config.Namespace
 	if err := r.Delete(ctx, jwtSecret); err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete build-api internal JWT secret: %w", err)
 	}
@@ -389,15 +455,15 @@ func (r *OperatorConfigReconciler) cleanupBuildAPI(ctx context.Context) error {
 
 const internalJWTExpiryThreshold = 30 * 24 * time.Hour // Regenerate when within 30 days of expiry
 
-func (r *OperatorConfigReconciler) ensureBuildAPIInternalJWTSecret(ctx context.Context, _ *automotivev1alpha1.OperatorConfig) error {
+func (r *OperatorConfigReconciler) ensureBuildAPIInternalJWTSecret(ctx context.Context, owner *automotivev1alpha1.OperatorConfig) error {
 	secret := &corev1.Secret{}
-	err := r.Get(ctx, client.ObjectKey{Name: internalJWTSecretName, Namespace: operatorNamespace}, secret)
+	err := r.Get(ctx, client.ObjectKey{Name: internalJWTSecretName, Namespace: owner.Namespace}, secret)
 	if err != nil {
 		if !errors.IsNotFound(err) {
 			return fmt.Errorf("failed to get internal JWT secret %s: %w", internalJWTSecretName, err)
 		}
 		// Secret doesn't exist, create it
-		secret, err = r.buildInternalJWTSecret(internalJWTSecretName)
+		secret, err = r.buildInternalJWTSecret(internalJWTSecretName, owner.Namespace)
 		if err != nil {
 			return fmt.Errorf("failed to build internal JWT secret: %w", err)
 		}
@@ -412,27 +478,27 @@ func (r *OperatorConfigReconciler) ensureBuildAPIInternalJWTSecret(ctx context.C
 	if !ok {
 		// No expires-at (old secret format), regenerate
 		r.Log.Info("Internal JWT secret missing expires-at, regenerating", "name", internalJWTSecretName)
-		return r.regenerateInternalJWTSecret(ctx)
+		return r.regenerateInternalJWTSecret(ctx, owner)
 	}
 	expiresAt, err := time.Parse(time.RFC3339, string(expiresAtBytes))
 	if err != nil {
 		r.Log.Info("Internal JWT secret has invalid expires-at, regenerating", "name", internalJWTSecretName, "error", err)
-		return r.regenerateInternalJWTSecret(ctx)
+		return r.regenerateInternalJWTSecret(ctx, owner)
 	}
 	if time.Until(expiresAt) < internalJWTExpiryThreshold {
 		r.Log.Info("Internal JWT secret expired or expiring soon, regenerating", "name", internalJWTSecretName, "expiresAt", expiresAt)
-		return r.regenerateInternalJWTSecret(ctx)
+		return r.regenerateInternalJWTSecret(ctx, owner)
 	}
 	return nil
 }
 
-func (r *OperatorConfigReconciler) regenerateInternalJWTSecret(ctx context.Context) error {
-	secret, err := r.buildInternalJWTSecret(internalJWTSecretName)
+func (r *OperatorConfigReconciler) regenerateInternalJWTSecret(ctx context.Context, owner *automotivev1alpha1.OperatorConfig) error {
+	secret, err := r.buildInternalJWTSecret(internalJWTSecretName, owner.Namespace)
 	if err != nil {
 		return fmt.Errorf("failed to build internal JWT secret: %w", err)
 	}
 	existing := &corev1.Secret{}
-	if err := r.Get(ctx, client.ObjectKey{Name: internalJWTSecretName, Namespace: operatorNamespace}, existing); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Name: internalJWTSecretName, Namespace: owner.Namespace}, existing); err != nil {
 		if !errors.IsNotFound(err) {
 			return err
 		}
@@ -464,6 +530,12 @@ func (r *OperatorConfigReconciler) createOrUpdate(
 		return err
 	}
 
+	// Skip update if resource is marked as unmanaged
+	if annotations := existing.GetAnnotations(); annotations != nil && annotations[unmanagedAnnotationKey] == unmanagedAnnotationTrue {
+		r.Log.Info("Skipping update for unmanaged resource", "name", obj.GetName(), "kind", obj.GetObjectKind().GroupVersionKind().Kind)
+		return nil
+	}
+
 	// Resource exists, update it
 	obj.SetResourceVersion(existing.GetResourceVersion())
 	return r.Update(ctx, obj)
@@ -475,6 +547,11 @@ func (r *OperatorConfigReconciler) deployOSBuilds(
 ) error {
 	r.Log.Info("Starting OSBuilds deployment")
 
+	// Deploy build controller (runs ImageBuild/Image/CatalogImage controllers)
+	if err := r.deployBuildController(ctx, config); err != nil {
+		return fmt.Errorf("failed to deploy build controller: %w", err)
+	}
+
 	// Deploy build-api (required for CLI access to builds)
 	if err := r.deployBuildAPI(ctx, config); err != nil {
 		return fmt.Errorf("failed to deploy build-api: %w", err)
@@ -484,20 +561,31 @@ func (r *OperatorConfigReconciler) deployOSBuilds(
 	var buildConfig *tasks.BuildConfig
 	if config.Spec.OSBuilds != nil {
 		buildConfig = &tasks.BuildConfig{
-			UseMemoryVolumes: config.Spec.OSBuilds.UseMemoryVolumes,
-			MemoryVolumeSize: config.Spec.OSBuilds.MemoryVolumeSize,
-			PVCSize:          config.Spec.OSBuilds.PVCSize,
-			RuntimeClassName: config.Spec.OSBuilds.RuntimeClassName,
+			UseMemoryVolumes:            config.Spec.OSBuilds.UseMemoryVolumes,
+			MemoryVolumeSize:            config.Spec.OSBuilds.MemoryVolumeSize,
+			PVCSize:                     config.Spec.OSBuilds.PVCSize,
+			RuntimeClassName:            config.Spec.OSBuilds.RuntimeClassName,
+			AutomotiveImageBuilderImage: config.Spec.GetImages().GetAutomotiveImageBuilderImage(),
+			YQHelperImage:               config.Spec.GetImages().GetYQHelperImage(),
+			BuildTimeoutMinutes:         config.Spec.OSBuilds.GetBuildTimeoutMinutes(),
+			FlashTimeoutMinutes:         config.Spec.OSBuilds.GetFlashTimeoutMinutes(),
+			DefaultLeaseDuration:        config.Spec.Jumpstarter.GetDefaultLeaseDuration(),
 		}
+	}
+
+	// Create target defaults ConfigMap (architecture, partition rules, etc.)
+	if err := r.createOrUpdateTargetDefaults(ctx, config); err != nil {
+		r.Log.Error(err, "Failed to create target defaults ConfigMap")
+		return fmt.Errorf("failed to create target defaults ConfigMap: %w", err)
 	}
 
 	// Generate and deploy Tekton tasks
 	tektonTasks := []*tektonv1.Task{
-		tasks.GenerateBuildAutomotiveImageTask(operatorNamespace, buildConfig, ""),
-		tasks.GeneratePushArtifactRegistryTask(operatorNamespace),
-		tasks.GeneratePrepareBuilderTask(operatorNamespace),
-		tasks.GenerateFlashTask(operatorNamespace),
+		tasks.GenerateBuildAutomotiveImageTask(config.Namespace, buildConfig, ""),
+		tasks.GeneratePushArtifactRegistryTask(config.Namespace, buildConfig),
+		tasks.GenerateFlashTask(config.Namespace, buildConfig),
 	}
+	tektonTasks = append(tektonTasks, tasks.GenerateSealedTasks(config.Namespace)...)
 
 	for _, task := range tektonTasks {
 		task.Labels["automotive.sdv.cloud.redhat.com/managed-by"] = config.Name
@@ -515,7 +603,7 @@ func (r *OperatorConfigReconciler) deployOSBuilds(
 	}
 
 	// Generate and deploy Tekton pipeline
-	pipeline := tasks.GenerateTektonPipeline("automotive-build-pipeline", operatorNamespace)
+	pipeline := tasks.GenerateTektonPipeline("automotive-build-pipeline", config.Namespace, buildConfig)
 	pipeline.Labels["automotive.sdv.cloud.redhat.com/managed-by"] = config.Name
 
 	if err := controllerutil.SetControllerReference(config, pipeline, r.Scheme); err != nil {
@@ -531,15 +619,164 @@ func (r *OperatorConfigReconciler) deployOSBuilds(
 	return nil
 }
 
-func (r *OperatorConfigReconciler) cleanupOSBuilds(ctx context.Context) error {
+func (r *OperatorConfigReconciler) createOrUpdateTargetDefaults(ctx context.Context, owner *automotivev1alpha1.OperatorConfig) error {
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "aib-target-defaults",
+			Namespace: owner.Namespace,
+		},
+		Data: map[string]string{
+			"target-defaults.yaml": targetDefaultsYAML,
+		},
+	}
+
+	if err := controllerutil.SetControllerReference(owner, configMap, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set controller reference: %w", err)
+	}
+
+	// Only create the ConfigMap if it doesn't exist; never overwrite user changes
+	existing := &corev1.ConfigMap{}
+	err := r.Get(ctx, client.ObjectKeyFromObject(configMap), existing)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return r.Create(ctx, configMap)
+		}
+		return err
+	}
+
+	return nil
+}
+
+func (r *OperatorConfigReconciler) deployBuildController(ctx context.Context, config *automotivev1alpha1.OperatorConfig) error {
+	// In "all" mode, build controllers run in-process; no separate deployment needed.
+	if os.Getenv("OPERATOR_MODE") == "all" {
+		r.Log.Info("Skipping build controller deployment (running in 'all' mode)")
+		return nil
+	}
+	r.Log.Info("Starting build controller deployment")
+
+	// Create/update ServiceAccount
+	sa := r.buildBuildControllerServiceAccount(config.Namespace)
+	if err := r.createOrUpdate(ctx, sa, config); err != nil {
+		return fmt.Errorf("failed to create/update build controller service account: %w", err)
+	}
+
+	// Create/update ClusterRole
+	clusterRole := r.buildBuildControllerClusterRole()
+	if err := r.createOrUpdate(ctx, clusterRole, config); err != nil {
+		return fmt.Errorf("failed to create/update build controller cluster role: %w", err)
+	}
+
+	// Create/update ClusterRoleBinding
+	clusterRoleBinding := r.buildBuildControllerClusterRoleBinding(config.Namespace)
+	if err := r.createOrUpdate(ctx, clusterRoleBinding, config); err != nil {
+		return fmt.Errorf("failed to create/update build controller cluster role binding: %w", err)
+	}
+
+	// Create/update leader election Role
+	leRole := r.buildBuildControllerLeaderElectionRole(config.Namespace)
+	if err := r.createOrUpdate(ctx, leRole, config); err != nil {
+		return fmt.Errorf("failed to create/update build controller leader election role: %w", err)
+	}
+
+	// Create/update leader election RoleBinding
+	leRoleBinding := r.buildBuildControllerLeaderElectionRoleBinding(config.Namespace)
+	if err := r.createOrUpdate(ctx, leRoleBinding, config); err != nil {
+		return fmt.Errorf("failed to create/update build controller leader election role binding: %w", err)
+	}
+
+	// Create/update Deployment with owner reference for reconciliation
+	deployment := r.buildBuildControllerDeployment(config.Namespace, config)
+	if err := controllerutil.SetControllerReference(config, deployment, r.Scheme); err != nil {
+		return fmt.Errorf("failed to set controller reference on build controller deployment: %w", err)
+	}
+	if err := r.createOrUpdate(ctx, deployment, config); err != nil {
+		return fmt.Errorf("failed to create/update build controller deployment: %w", err)
+	}
+
+	r.Log.Info("Build controller deployment completed successfully")
+	return nil
+}
+
+func (r *OperatorConfigReconciler) cleanupBuildController(ctx context.Context, config *automotivev1alpha1.OperatorConfig) error {
+	// In "all" mode, build controllers run in-process; nothing to clean up.
+	if os.Getenv("OPERATOR_MODE") == "all" {
+		r.Log.Info("Skipping build controller cleanup (running in 'all' mode)")
+		return nil
+	}
+	r.Log.Info("Cleaning up build controller resources")
+
+	// Delete Deployment
+	deployment := &appsv1.Deployment{}
+	deployment.Name = buildControllerName
+	deployment.Namespace = config.Namespace
+	if err := r.Delete(ctx, deployment); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete build controller deployment: %w", err)
+	}
+
+	// Delete ServiceAccount
+	sa := &corev1.ServiceAccount{}
+	sa.Name = buildControllerName
+	sa.Namespace = config.Namespace
+	if err := r.Delete(ctx, sa); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete build controller service account: %w", err)
+	}
+
+	// Delete ClusterRole
+	clusterRole := &rbacv1.ClusterRole{}
+	clusterRole.Name = buildControllerName
+	if err := r.Delete(ctx, clusterRole); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete build controller cluster role: %w", err)
+	}
+
+	// Delete ClusterRoleBinding
+	clusterRoleBinding := &rbacv1.ClusterRoleBinding{}
+	clusterRoleBinding.Name = buildControllerName
+	if err := r.Delete(ctx, clusterRoleBinding); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete build controller cluster role binding: %w", err)
+	}
+
+	// Delete leader election Role
+	leRole := &rbacv1.Role{}
+	leRole.Name = buildControllerName + "-leader-election"
+	leRole.Namespace = config.Namespace
+	if err := r.Delete(ctx, leRole); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete build controller leader election role: %w", err)
+	}
+
+	// Delete leader election RoleBinding
+	leRoleBinding := &rbacv1.RoleBinding{}
+	leRoleBinding.Name = buildControllerName + "-leader-election"
+	leRoleBinding.Namespace = config.Namespace
+	if err := r.Delete(ctx, leRoleBinding); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete build controller leader election role binding: %w", err)
+	}
+
+	r.Log.Info("Build controller cleanup completed")
+	return nil
+}
+
+func (r *OperatorConfigReconciler) cleanupOSBuilds(ctx context.Context, config *automotivev1alpha1.OperatorConfig) error {
 	r.Log.Info("Cleaning up OSBuilds resources")
 
+	// Delete target defaults ConfigMap
+	configMap := &corev1.ConfigMap{}
+	configMap.Name = "aib-target-defaults"
+	configMap.Namespace = config.Namespace
+	if err := r.Delete(ctx, configMap); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete target defaults ConfigMap: %w", err)
+	}
+	r.Log.Info("Target defaults ConfigMap deleted")
+
 	// Delete Tekton tasks
-	taskNames := []string{"build-automotive-image", "push-artifact-registry", "prepare-builder", "flash-image"}
+	taskNames := []string{
+		"build-automotive-image", "push-artifact-registry", "prepare-builder", "flash-image",
+		"sealed-prepare-reseal", "sealed-reseal", "sealed-extract-for-signing", "sealed-inject-signed",
+	}
 	for _, taskName := range taskNames {
 		task := &tektonv1.Task{}
 		task.Name = taskName
-		task.Namespace = operatorNamespace
+		task.Namespace = config.Namespace
 		if err := r.Delete(ctx, task); err != nil && !errors.IsNotFound(err) {
 			return fmt.Errorf("failed to delete task %s: %w", taskName, err)
 		}
@@ -549,15 +786,20 @@ func (r *OperatorConfigReconciler) cleanupOSBuilds(ctx context.Context) error {
 	// Delete Tekton pipeline
 	pipeline := &tektonv1.Pipeline{}
 	pipeline.Name = "automotive-build-pipeline"
-	pipeline.Namespace = operatorNamespace
+	pipeline.Namespace = config.Namespace
 	if err := r.Delete(ctx, pipeline); err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete pipeline: %w", err)
 	}
 	r.Log.Info("Pipeline deleted")
 
 	// Cleanup build-api
-	if err := r.cleanupBuildAPI(ctx); err != nil {
+	if err := r.cleanupBuildAPI(ctx, config); err != nil {
 		return fmt.Errorf("failed to cleanup build-api: %w", err)
+	}
+
+	// Cleanup build controller
+	if err := r.cleanupBuildController(ctx, config); err != nil {
+		return fmt.Errorf("failed to cleanup build controller: %w", err)
 	}
 
 	r.Log.Info("OSBuilds cleanup completed successfully")
@@ -575,7 +817,7 @@ func (r *OperatorConfigReconciler) createOrUpdateTask(ctx context.Context, task 
 	}
 
 	// Skip update if task is marked as unmanaged
-	if existingTask.Annotations != nil && existingTask.Annotations["automotive.sdv.cloud.redhat.com/unmanaged"] == "true" {
+	if existingTask.Annotations != nil && existingTask.Annotations[unmanagedAnnotationKey] == unmanagedAnnotationTrue {
 		r.Log.Info("Skipping update for unmanaged task", "name", task.Name)
 		return nil
 	}
@@ -595,8 +837,7 @@ func (r *OperatorConfigReconciler) createOrUpdatePipeline(ctx context.Context, p
 	}
 
 	// Skip update if pipeline is marked as unmanaged
-	unmanagedAnnotation := "automotive.sdv.cloud.redhat.com/unmanaged"
-	if existingPipeline.Annotations != nil && existingPipeline.Annotations[unmanagedAnnotation] == "true" {
+	if existingPipeline.Annotations != nil && existingPipeline.Annotations[unmanagedAnnotationKey] == unmanagedAnnotationTrue {
 		r.Log.Info("Skipping update for unmanaged pipeline", "name", pipeline.Name)
 		return nil
 	}

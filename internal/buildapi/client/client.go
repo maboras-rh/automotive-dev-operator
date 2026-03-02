@@ -167,9 +167,43 @@ func (c *Client) GetBuild(ctx context.Context, name string) (*buildapi.BuildResp
 	return &out, nil
 }
 
-// ListBuilds retrieves a list of all builds from the API server.
-func (c *Client) ListBuilds(ctx context.Context) ([]buildapi.BuildListItem, error) {
-	endpoint := c.resolve("/v1/builds")
+// GetBuildProgress retrieves the current progress of a build.
+// Returns nil, nil (no error) on 404 to handle older servers gracefully.
+func (c *Client) GetBuildProgress(ctx context.Context, name string) (*buildapi.BuildProgress, error) {
+	endpoint := c.resolve(path.Join("/v1/builds", url.PathEscape(name), "progress"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.authToken)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close response body: %v\n", err)
+		}
+	}()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("get build progress failed: %s: %s", resp.Status, string(b))
+	}
+	var out buildapi.BuildProgress
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// GetBuildTemplate retrieves a build template reconstructed from ImageBuild inputs.
+func (c *Client) GetBuildTemplate(ctx context.Context, name string) (*buildapi.BuildTemplateResponse, error) {
+	endpoint := c.resolve(path.Join("/v1/builds", url.PathEscape(name), "template"))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -188,10 +222,19 @@ func (c *Client) ListBuilds(ctx context.Context) ([]buildapi.BuildListItem, erro
 	}()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("list builds failed: %s: %s", resp.Status, string(b))
+		return nil, fmt.Errorf("get build template failed: %s: %s", resp.Status, string(b))
 	}
-	var out []buildapi.BuildListItem
+	var out buildapi.BuildTemplateResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListBuilds retrieves a list of all builds from the API server.
+func (c *Client) ListBuilds(ctx context.Context) ([]buildapi.BuildListItem, error) {
+	var out []buildapi.BuildListItem
+	if err := c.listJSON(ctx, c.resolve("/v1/builds"), "list builds", &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -277,7 +320,83 @@ func (c *Client) GetFlash(ctx context.Context, name string) (*buildapi.FlashResp
 
 // ListFlash retrieves a list of all flash jobs from the API server.
 func (c *Client) ListFlash(ctx context.Context) ([]buildapi.FlashListItem, error) {
-	endpoint := c.resolve("/v1/flash")
+	var out []buildapi.FlashListItem
+	if err := c.listJSON(ctx, c.resolve("/v1/flash"), "list flash", &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// listJSON performs a list-style GET request and decodes a JSON array response into out.
+func (c *Client) listJSON(ctx context.Context, endpoint, operation string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	if c.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.authToken)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close response body: %v\n", err)
+		}
+	}()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("%s failed: %s: %s", operation, resp.Status, string(b))
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return err
+	}
+	return nil
+}
+
+// CreateSealed submits a new sealed operation to the API server.
+// The operation-specific endpoint is resolved from req.Operation.
+//
+//nolint:dupl // Sealed and Build methods are intentionally similar but work with different types
+func (c *Client) CreateSealed(ctx context.Context, req buildapi.SealedRequest) (*buildapi.SealedResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := c.resolve(buildapi.SealedOperationAPIPath(req.Operation))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if c.authToken != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.authToken)
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close response body: %v\n", err)
+		}
+	}()
+	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("create reseal failed: %s: %s", resp.Status, string(b))
+	}
+	var out buildapi.SealedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// GetSealed retrieves the status of a sealed job by name.
+// The operation determines which API path to query (e.g. /v1/reseals/:name).
+func (c *Client) GetSealed(ctx context.Context, op buildapi.SealedOperation, name string) (*buildapi.SealedResponse, error) {
+	endpoint := c.resolve(path.Join(buildapi.SealedOperationAPIPath(op), url.PathEscape(name)))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -296,9 +415,40 @@ func (c *Client) ListFlash(ctx context.Context) ([]buildapi.FlashListItem, error
 	}()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("list flash failed: %s: %s", resp.Status, string(b))
+		return nil, fmt.Errorf("get reseal failed: %s: %s", resp.Status, string(b))
 	}
-	var out []buildapi.FlashListItem
+	var out buildapi.SealedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListSealed retrieves a list of sealed jobs from the API server.
+// The operation determines which API path to query (e.g. /v1/reseals).
+func (c *Client) ListSealed(ctx context.Context, op buildapi.SealedOperation) ([]buildapi.SealedListItem, error) {
+	endpoint := c.resolve(buildapi.SealedOperationAPIPath(op))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.authToken)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close response body: %v\n", err)
+		}
+	}()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("list reseal failed: %s: %s", resp.Status, string(b))
+	}
+	var out []buildapi.SealedListItem
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
 	}
@@ -333,6 +483,12 @@ func (c *Client) UploadFiles(ctx context.Context, name string, files []Upload) e
 		go func() {
 			defer close(done)
 			for _, f := range files {
+				// Write destination path as a separate field since Go's Part.FileName()
+				// strips directory paths per RFC 7578
+				if err := mw.WriteField("path", f.DestPath); err != nil {
+					_ = pw.CloseWithError(err)
+					return
+				}
 				file, err := os.Open(f.SourcePath)
 				if err != nil {
 					_ = pw.CloseWithError(err)
@@ -384,4 +540,137 @@ func (c *Client) UploadFiles(ctx context.Context, name string, files []Upload) e
 		return fmt.Errorf("upload failed: %s: %s", resp.Status, string(b))
 	}
 	return nil
+}
+
+// CreateContainerBuild submits a new container build request to the API server.
+//
+//nolint:dupl // Container build and regular build methods are intentionally similar but work with different types
+func (c *Client) CreateContainerBuild(ctx context.Context, req buildapi.ContainerBuildRequest) (*buildapi.ContainerBuildResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := c.resolve("/v1/container-builds")
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if c.authToken != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.authToken)
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close response body: %v\n", err)
+		}
+	}()
+	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("create container build failed: %s: %s", resp.Status, string(b))
+	}
+	var out buildapi.ContainerBuildResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// GetContainerBuild retrieves the status of a specific container build by name.
+func (c *Client) GetContainerBuild(ctx context.Context, name string) (*buildapi.ContainerBuildResponse, error) {
+	endpoint := c.resolve(path.Join("/v1/container-builds", url.PathEscape(name)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.authToken)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close response body: %v\n", err)
+		}
+	}()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("get container build failed: %s: %s", resp.Status, string(b))
+	}
+	var out buildapi.ContainerBuildResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListContainerBuilds retrieves a list of all container builds from the API server.
+func (c *Client) ListContainerBuilds(ctx context.Context) ([]buildapi.ContainerBuildListItem, error) {
+	var out []buildapi.ContainerBuildListItem
+	if err := c.listJSON(ctx, c.resolve("/v1/container-builds"), "list container builds", &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// UploadContainerBuildContext uploads a tarball of the build context to the API server.
+func (c *Client) UploadContainerBuildContext(ctx context.Context, name string, tarball io.Reader) error {
+	endpoint := c.resolve(path.Join("/v1/container-builds", url.PathEscape(name), "upload"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, tarball)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	if c.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.authToken)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close response body: %v\n", err)
+		}
+	}()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("upload context failed: %s: %s", resp.Status, string(b))
+	}
+	return nil
+}
+
+// GetOperatorConfig retrieves the operator configuration for CLI validation.
+func (c *Client) GetOperatorConfig(ctx context.Context) (*buildapi.OperatorConfigResponse, error) {
+	endpoint := c.resolve("/v1/config")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+	if c.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.authToken)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close response body: %v\n", err)
+		}
+	}()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("get config failed: %s: %s", resp.Status, string(b))
+	}
+	var config buildapi.OperatorConfigResponse
+	if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
+		return nil, fmt.Errorf("decoding response: %w", err)
+	}
+	return &config, nil
 }

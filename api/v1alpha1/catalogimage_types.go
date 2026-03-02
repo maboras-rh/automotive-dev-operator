@@ -318,7 +318,7 @@ const (
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`,priority=0
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`,priority=0
 
-// CatalogImage is the Schema for the catalogimages API
+// CatalogImage represents an automotive OS image in the catalog registry for discovery and deployment
 type CatalogImage struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

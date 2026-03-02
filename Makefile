@@ -3,7 +3,7 @@
 # To re-generate a bundle for another specific version without changing the standard setup, you can:
 # - use the VERSION as arg of the bundle target (e.g make bundle VERSION=0.0.2)
 # - use environment variables to overwrite this value (e.g export VERSION=0.0.2)
-VERSION ?= 0.0.1
+VERSION ?= 0.1.0
 
 # CHANNELS define the bundle channels used in the bundle.
 # Add a new line here if you would like to change its default config. (E.g CHANNELS = "candidate,fast,stable")
@@ -48,9 +48,9 @@ endif
 
 # Set the Operator SDK version to use. By default, what is installed on the system is used.
 # This is useful for CI or a project to utilize a specific version of the operator-sdk toolkit.
-OPERATOR_SDK_VERSION ?= v1.39.1
+OPERATOR_SDK_VERSION ?= v1.42.0
 # Image URL to use all building/pushing image targets
-IMG ?= quay.io/rh-sdv-cloud/automotive-dev-operator:latest
+IMG ?= $(IMAGE_TAG_BASE):v$(VERSION)
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION = 1.31.0
 
@@ -99,7 +99,7 @@ help: ## Display this help.
 
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	$(CONTROLLER_GEN) rbac:roleName=ado-manager-role crd webhook paths="./api/..." paths="./internal/controller/..." output:crd:artifacts:config=config/crd/bases
+	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./api/..." paths="./internal/controller/..." output:crd:artifacts:config=config/crd/bases
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -278,6 +278,10 @@ bundle: manifests kustomize operator-sdk ## Generate bundle manifests and metada
 	$(OPERATOR_SDK) generate kustomize manifests -q
 	cd config/manager && $(KUSTOMIZE) edit set image controller=$(IMG)
 	$(KUSTOMIZE) build config/manifests | $(OPERATOR_SDK) generate bundle $(BUNDLE_GEN_FLAGS)
+	@# Replace OPERATOR_IMAGE environment variable and VERSION placeholder in CSV
+	sed -i.bak 's|value: controller:latest|value: $(IMG)|g' ./bundle/manifests/*.yaml && rm -f ./bundle/manifests/*.bak
+	sed -i.bak 's|value: $(IMAGE_TAG_BASE):latest|value: $(IMG)|g' ./bundle/manifests/*.yaml && rm -f ./bundle/manifests/*.bak
+	sed -i.bak 's|VERSION|$(VERSION)|g' ./bundle/manifests/*.yaml && rm -f ./bundle/manifests/*.bak
 	$(OPERATOR_SDK) bundle validate ./bundle
 
 .PHONY: bundle-build
@@ -342,9 +346,42 @@ catalog-update: ## Update catalog configuration with current bundle image
 
 .PHONY: build-caib
 build-caib: ## Build the caib tool
-	go build -ldflags "-X main.version=$(VERSION)" -o bin/caib cmd/caib/main.go
+	go build -tags containers_image_openpgp -ldflags "-X main.version=$(VERSION)" -o bin/caib cmd/caib/main.go
 
 .PHONY: build-api-server
 build-api-server: ## Build the api server
 	go build -o bin/build-api cmd/build-api/main.go
+
+##@ Release
+
+.PHONY: prepare-release
+prepare-release: ## Prepare a release (usage: make prepare-release VERSION=0.1.0)
+	@./hack/prepare-release.sh $(VERSION)
+
+.PHONY: bundle-validate-operatorhub
+bundle-validate-operatorhub: operator-sdk ## Validate bundle for OperatorHub submission
+	$(OPERATOR_SDK) bundle validate ./bundle
+	$(OPERATOR_SDK) bundle validate ./bundle --select-optional name=operatorhubv2
+	$(OPERATOR_SDK) bundle validate ./bundle --select-optional name=capabilities
+	$(OPERATOR_SDK) bundle validate ./bundle --select-optional name=categories
+
+.PHONY: community-operators-bundle
+community-operators-bundle: bundle ## Prepare bundle for community-operators-prod submission
+	@mkdir -p community-operators-prod/operators/automotive-dev-operator/$(VERSION)/manifests
+	@mkdir -p community-operators-prod/operators/automotive-dev-operator/$(VERSION)/metadata
+	@cp -r bundle/manifests/* community-operators-prod/operators/automotive-dev-operator/$(VERSION)/manifests/
+	@cp -r bundle/metadata/* community-operators-prod/operators/automotive-dev-operator/$(VERSION)/metadata/
+	@if ! grep -q 'com.redhat.openshift.versions' community-operators-prod/operators/automotive-dev-operator/$(VERSION)/metadata/annotations.yaml; then \
+		echo '  com.redhat.openshift.versions: v4.18-v4.21' >> community-operators-prod/operators/automotive-dev-operator/$(VERSION)/metadata/annotations.yaml; \
+	fi
+	@if [ ! -f community-operators-prod/operators/automotive-dev-operator/ci.yaml ]; then \
+		echo "updateGraph: semver-mode" > community-operators-prod/operators/automotive-dev-operator/ci.yaml; \
+		echo "Created ci.yaml with default updateGraph: semver-mode"; \
+	else \
+		echo "Using existing ci.yaml (not overwriting)"; \
+	fi
+	@echo "Bundle prepared at: community-operators-prod/operators/automotive-dev-operator/$(VERSION)"
+
+.PHONY: release-images
+release-images: docker-buildx bundle-build bundle-push catalog-build catalog-push ## Build and push all release images (operator, bundle, catalog)
 

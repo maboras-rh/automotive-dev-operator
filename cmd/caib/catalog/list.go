@@ -25,6 +25,7 @@ import (
 	"os"
 	"text/tabwriter"
 
+	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/config"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
@@ -88,14 +89,14 @@ type Target struct {
 	Name string `json:"name"`
 }
 
-func runList(_ *cobra.Command, _ []string) error {
+func runList(cmd *cobra.Command, _ []string) error {
 	// Get server URL
 	server := serverURL
 	if server == "" {
-		server = os.Getenv("CAIB_SERVER")
+		server = config.DefaultServer()
 	}
 	if server == "" {
-		return fmt.Errorf("server URL required (use --server or CAIB_SERVER env var)")
+		return fmt.Errorf("server URL required (use --server, CAIB_SERVER env var or run 'caib login <server-url>')")
 	}
 
 	// Get auth token
@@ -143,7 +144,7 @@ func runList(_ *cobra.Command, _ []string) error {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	client := &http.Client{}
+	client := newHTTPClient(getInsecureSkipTLS(cmd))
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to make request: %w", err)
