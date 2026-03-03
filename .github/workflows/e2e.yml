@@ -10,8 +10,15 @@ on:
       - main
       - "release-*"
   workflow_dispatch:
+    inputs:
+      debug_enabled:
+        description: 'Enable debug logging (ACTIONS_STEP_DEBUG)'
+        required: false
+        default: 'false'
+        type: boolean
 
 env:
+  ACTIONS_STEP_DEBUG: ${{ github.event.inputs.debug_enabled || 'false' }}
   GO_VERSION: '1.24'
   KIND_VERSION: v0.24.0
   KUBECTL_VERSION: v1.31.0
