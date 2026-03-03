@@ -84,16 +84,16 @@ jobs:
       # ---------------------------------------------------------------
       - name: Create Kind cluster
         run: |
-          kind create cluster --name "$CLUSTER_NAME" --wait 5m
-          kubectl cluster-info --context "kind-$CLUSTER_NAME"
+          kind create cluster --name "{{ env.CLUSTER_NAME }}" --wait 5m
+          kubectl cluster-info --context "kind-{{ env.CLUSTER_NAME }}"
           kubectl label nodes --all aib=true
           kubectl get nodes --show-labels
 
       - name: Connect registry to Kind network
         run: |
-          docker network connect kind "${REGISTRY_NAME}"
-          for node in $(kind get nodes --name "${CLUSTER_NAME}"); do
-            kubectl annotate node "${node}" "kind.x-k8s.io/registry=localhost:${REGISTRY_PORT}" --overwrite
+          docker network connect kind "{{ env.REGISTRY_NAME }}"
+          for node in $(kind get nodes --name "{{ env.CLUSTER_NAME }}"); do
+            kubectl annotate node "${node}" "kind.x-k8s.io/registry=localhost:{{ env.REGISTRY_PORT }}" --overwrite
           done
           kubectl wait --for=condition=Ready nodes --all --timeout=60s
 
@@ -110,7 +110,7 @@ jobs:
             namespace: kube-public
           data:
             localRegistryHosting.v1: |
-              host: "localhost:${REGISTRY_PORT}"
+              host: "localhost:{{ env.REGISTRY_PORT }}"
               help: "https://kind.sigs.k8s.io/docs/user/local-registry/"
           EOF
 
@@ -118,11 +118,16 @@ jobs:
 
           REGISTRY_IP=""
           for i in $(seq 1 30); do
-            REGISTRY_IP=$(docker inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' "${REGISTRY_NAME}")
-            if [ -n "$REGISTRY_IP" ]; then break; fi
+            REGISTRY_IP=$(docker inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' "{{ env.REGISTRY_NAME }}")
+            if [ -n "$REGISTRY_IP" ]; then 
+              echo "Registry IP found: $REGISTRY_IP"
+              break; 
+            fi
+            echo "Waiting for registry IP..."
             sleep 1
           done
           echo "Registry IP: $REGISTRY_IP"
+          echo "REGISTRY_IP=$REGISTRY_IP" >> $GITHUB_ENV
 
           cat <<EOF | kubectl apply -f -
           apiVersion: v1
@@ -144,7 +149,7 @@ jobs:
             namespace: openshift-image-registry
           subsets:
           - addresses:
-            - ip: ${REGISTRY_IP}
+            - ip: {{ env.REGISTRY_IP }}
             ports:
             - port: 5000
               name: registry
@@ -196,7 +201,7 @@ jobs:
           BUILD_PLATFORM: linux/${{ env.ARCH }}
         run: |
           make docker-build IMG=automotive-dev-operator:test
-          kind load docker-image automotive-dev-operator:test --name "$CLUSTER_NAME"
+          kind load docker-image automotive-dev-operator:test --name "{{ env.CLUSTER_NAME }}"
 
       - name: Deploy operator
         run: |
@@ -216,7 +221,7 @@ jobs:
       - name: Patch OperatorConfig for Kind registry
         run: |
           kubectl patch operatorconfig config -n automotive-dev-operator-system --type=merge \
-            -p '{"spec":{"osBuilds":{"clusterRegistryRoute":"'"${REGISTRY_HOST}"':5000"}}}'
+            -p '{"spec":{"osBuilds":{"clusterRegistryRoute":"'"{{ env.REGISTRY_HOST }}"':5000"}}}'
 
       - name: Patch push-artifact-registry Task for plain HTTP
         run: |
@@ -244,19 +249,19 @@ jobs:
       - name: Run caib container build
         run: |
           bin/caib build test/config/test-manifest.aib.yml \
-            --arch ${ARCH} \
-            --push ${REGISTRY_HOST}:5000/myorg/automotive-os:latest \
+            --arch "{{ env.ARCH }}" \
+            --push "{{ env.REGISTRY_HOST }}:5000/myorg/automotive-os:latest" \
             --follow
 
       - name: Run caib disk build with download
         run: |
           bin/caib build test/config/test-manifest.aib.yml \
-            --arch ${ARCH} \
-            --push ${REGISTRY_HOST}:5000/myorg/automotive-os:latest \
+            --arch "{{ env.ARCH }}" \
+            --push "{{ env.REGISTRY_HOST }}:5000/myorg/automotive-os:latest" \
             --target qemu \
             --disk \
             --format qcow2 \
-            --push-disk ${REGISTRY_HOST}:5000/myorg/automotive-os:latest-disk \
+            --push-disk "{{ env.REGISTRY_HOST }}:5000/myorg/automotive-os:latest-disk" \
             --output "./output/automotive-os-latest.qcow2" \
             --follow
 
@@ -285,6 +290,6 @@ jobs:
         if: always()
         run: |
           kind delete cluster --name $CLUSTER_NAME || true
-          docker rm -f $REGISTRY_NAME || true
-          sudo sed -i "/${REGISTRY_HOST}/d" /etc/hosts 2>/dev/null || true
+          docker rm -f "{{ env.REGISTRY_NAME }}" || true
+          sudo sed -i "/{{ env.REGISTRY_HOST }}/d" /etc/hosts 2>/dev/null || true
           sudo rm -f /etc/containers/registries.conf.d/kind-e2e-registry.conf || true
