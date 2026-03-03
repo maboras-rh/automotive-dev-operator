@@ -220,6 +220,10 @@ jobs:
           kubectl label namespace automotive-dev-operator-system pod-security.kubernetes.io/warn=privileged --overwrite
           make install
           make deploy IMG=automotive-dev-operator:test
+          # DEBUG 
+          sleep 10
+          kubectl get deployment -n automotive-dev-operator-system
+          
           kubectl wait --for=condition=available --timeout=10m deployment/ado-controller-manager -n automotive-dev-operator-system
 
       # fix
