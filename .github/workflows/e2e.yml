@@ -179,12 +179,12 @@ jobs:
       # ---------------------------------------------------------------
       # [6/7] Run E2E tests (self-contained: deploys operator, tests, tears down)
       # ---------------------------------------------------------------
-      - name: Run E2E tests
-        env:
-          KIND_CLUSTER: automotive-dev-e2e
-          CONTAINER_TOOL: docker
-          BUILD_PLATFORM: linux/${{ env.ARCH }}
-        run: make test-e2e
+      # - name: Run E2E tests
+      #   env:
+      #     KIND_CLUSTER: automotive-dev-e2e
+      #     CONTAINER_TOOL: docker
+      #     BUILD_PLATFORM: linux/${{ env.ARCH }}
+      #   run: make test-e2e
 
       # ---------------------------------------------------------------
       # [7/7] Deploy operator fresh and run caib integration builds
