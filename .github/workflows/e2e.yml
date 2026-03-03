@@ -234,7 +234,10 @@ jobs:
             | kubectl replace -f -
 
       - name: Build caib CLI
-        run: make build-caib
+        run: |
+          make build-caib
+          echo "=== caib version and available commands ==="
+          bin/caib --help
 
       - name: Set up Build API access
         run: |
