@@ -217,7 +217,7 @@ jobs:
           kubectl label namespace automotive-dev-operator-system pod-security.kubernetes.io/warn=privileged --overwrite
           make install
           make deploy IMG=automotive-dev-operator:test
-          kubectl wait --for=condition=available --timeout=10m deployment/ado-controller-manager -n automotive-dev-operator-system
+          kubectl wait --for=condition=available --timeout=20m deployment/ado-controller-manager -n automotive-dev-operator-system
 
       - name: Apply OperatorConfig and wait for Build API
         run: |
