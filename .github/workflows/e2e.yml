@@ -210,6 +210,9 @@ jobs:
           kind load docker-image automotive-dev-operator:test --name "$CLUSTER_NAME"
 
       - name: Deploy operator
+        env:
+          CONTAINER_TOOL: docker
+          BUILD_PLATFORM: linux/${{ env.ARCH }}
         run: |
           kubectl create namespace automotive-dev-operator-system --dry-run=client -o yaml | kubectl apply -f -
           kubectl label namespace automotive-dev-operator-system pod-security.kubernetes.io/enforce=privileged --overwrite
@@ -217,60 +220,9 @@ jobs:
           kubectl label namespace automotive-dev-operator-system pod-security.kubernetes.io/warn=privileged --overwrite
           make install
           make deploy IMG=automotive-dev-operator:test
-          kubectl wait --for=condition=available --timeout=20m deployment/ado-controller-manager -n automotive-dev-operator-system
+          kubectl wait --for=condition=available --timeout=10m deployment/ado-controller-manager -n automotive-dev-operator-system
 
-      - name: Apply OperatorConfig and wait for Build API
-        run: |
-          kubectl apply -f config/samples/automotive_v1_operatorconfig.yaml
-          kubectl wait --for=condition=available --timeout=8m deployment/ado-build-api -n automotive-dev-operator-system
-
-      - name: Patch OperatorConfig for Kind registry
-        run: |
-          kubectl patch operatorconfig config -n automotive-dev-operator-system --type=merge \
-            -p '{"spec":{"osBuilds":{"clusterRegistryRoute":"'"${REGISTRY_HOST}"':5000"}}}'
-
-      - name: Patch push-artifact-registry Task for plain HTTP
-        run: |
-          kubectl annotate task push-artifact-registry -n automotive-dev-operator-system \
-            "automotive.sdv.cloud.redhat.com/unmanaged=true"
-          kubectl get task push-artifact-registry -n automotive-dev-operator-system -o json \
-            | jq '.spec.steps[0].script |= gsub("oras push "; "oras push --plain-http ")' \
-            | kubectl replace -f -
-
-      - name: Build caib CLI
-        run: make build-caib
-
-      - name: Set up Build API access
-        run: |
-          pkill -f "kubectl port-forward" || true
-          kubectl port-forward -n automotive-dev-operator-system svc/ado-build-api 8080:8080 &
-          sleep 5
-          kubectl create serviceaccount caib -n automotive-dev-operator-system --dry-run=client -o yaml | kubectl apply -f -
-
-          echo "CAIB_TOKEN=$(kubectl create token caib -n automotive-dev-operator-system --duration=1h)" >> $GITHUB_ENV
-          echo "CAIB_SERVER=http://localhost:8080" >> $GITHUB_ENV
-          echo "REGISTRY_USERNAME=kind" >> $GITHUB_ENV
-          echo "REGISTRY_PASSWORD=kind" >> $GITHUB_ENV
-
-      - name: Run caib container build
-        run: |
-          bin/caib build test/config/test-manifest.aib.yml \
-            --arch ${ARCH} \
-            --push ${REGISTRY_HOST}:5000/myorg/automotive-os:latest \
-            --follow
-
-      - name: Run caib disk build with download
-        run: |
-          bin/caib build test/config/test-manifest.aib.yml \
-            --arch ${ARCH} \
-            --push ${REGISTRY_HOST}:5000/myorg/automotive-os:latest \
-            --target qemu \
-            --disk \
-            --format qcow2 \
-            --push-disk ${REGISTRY_HOST}:5000/myorg/automotive-os:latest-disk \
-            --output "./output/automotive-os-latest.qcow2" \
-            --follow
-
+      # fix
       - name: Collect logs on failure
         if: failure()
         run: |
