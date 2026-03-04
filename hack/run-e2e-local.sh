@@ -173,7 +173,7 @@ metadata:
   namespace: openshift-image-registry
 subsets:
 - addresses:
-  - ip: ${REGISTRY_IP} 
+  - ip: ${REGISTRY_IP}
   ports:
   - port: 5000
     name: registry
@@ -217,7 +217,7 @@ make build-caib
 make deploy IMG=automotive-dev-operator:test
 
 # Wait for operator
-kubectl wait --for=condition=available --timeout=10m deployment/ado-controller-manager -n automotive-dev-operator-system
+kubectl wait --for=condition=available --timeout=10m deployment/ado-operator -n automotive-dev-operator-system
 
 # Apply Samples
 kubectl apply -f config/samples/automotive_v1_operatorconfig.yaml
@@ -227,13 +227,16 @@ kubectl wait --for=condition=available --timeout=8m deployment/ado-build-api -n 
 kubectl patch operatorconfig config -n automotive-dev-operator-system --type=merge \
   -p '{"spec":{"osBuilds":{"clusterRegistryRoute":"image-registry.openshift-image-registry.svc:5000"}}}'
 
-# Patch push-artifact-registry Task for Kind's plain-HTTP registry.
+# Patch push-artifact-registry Task for Kind:
+#   - plain-HTTP registry (oras push --plain-http)
+#   - runAsUser 0 so the step can read files created by the privileged build step
 
 # Mark as unmanaged so the operator won't overwrite the patch.
 kubectl annotate task push-artifact-registry -n automotive-dev-operator-system \
   "automotive.sdv.cloud.redhat.com/unmanaged=true"
 kubectl get task push-artifact-registry -n automotive-dev-operator-system -o json \
-  | jq '.spec.steps[0].script |= gsub("oras push "; "oras push --plain-http ")' \
+  | jq '.spec.steps[0].script |= gsub("push --disable-path-validation"; "push --plain-http --disable-path-validation")' \
+  | jq '.spec.steps[0].securityContext = {"runAsUser": 0}' \
   | kubectl replace -f -
 
 # ------------------------------------------------------------------

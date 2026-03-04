@@ -225,12 +225,13 @@ jobs:
           kubectl patch operatorconfig config -n automotive-dev-operator-system --type=merge \
             -p '{"spec":{"osBuilds":{"clusterRegistryRoute":"'"${REGISTRY_HOST}"':5000"}}}'
 
-      - name: Patch push-artifact-registry Task for plain HTTP
+      - name: Patch push-artifact-registry Task for Kind
         run: |
           kubectl annotate task push-artifact-registry -n automotive-dev-operator-system \
             "automotive.sdv.cloud.redhat.com/unmanaged=true"
           kubectl get task push-artifact-registry -n automotive-dev-operator-system -o json \
-            | jq '.spec.steps[0].script |= gsub("oras push "; "oras push --plain-http ")' \
+            | jq '.spec.steps[0].script |= gsub("push --disable-path-validation"; "push --plain-http --disable-path-validation")' \
+            | jq '.spec.steps[0].securityContext = {"runAsUser": 0}' \
             | kubectl replace -f -
 
       - name: Build caib CLI
