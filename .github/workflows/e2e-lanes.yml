@@ -144,11 +144,12 @@ jobs:
           E2E_LABEL_FILTER: ${{ needs.parse-comment.outputs.label_filter }}
           E2E_NAMESPACE: ${{ needs.parse-comment.outputs.lane_name == 'all' && 'e2e-test-all' || format('e2e-{0}', needs.parse-comment.outputs.lane_name) }}
         run: |
+          source hack/e2e/timeouts.env
           case "${{ needs.parse-comment.outputs.lane_name }}" in
-            smoke|operator|auth|features) test_timeout=10m ;;
-            bootc|package-mode) test_timeout=15m ;;
-            container-build|all) test_timeout=45m ;;
-            *)                   echo "Unknown lane: ${{ needs.parse-comment.outputs.lane_name }}" >&2; exit 1 ;;
+            smoke|operator|auth|features) test_timeout=$E2E_TIMEOUT_FAST ;;
+            bootc|package-mode)           test_timeout=$E2E_TIMEOUT_SHORT ;;
+            container-build|all)          test_timeout=$E2E_TIMEOUT_LONG ;;
+            *)                            echo "Unknown lane: ${{ needs.parse-comment.outputs.lane_name }}" >&2; exit 1 ;;
           esac
           ginkgo_args=(-v -ginkgo.v -timeout "$test_timeout")
           if [ -n "$E2E_LABEL_FILTER" ]; then

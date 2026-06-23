@@ -67,14 +67,15 @@ jobs:
           E2E_LABEL_FILTER: ${{ github.event_name == 'pull_request' && 'smoke' || github.event.inputs.label_filter || '' }}
           E2E_NAMESPACE: ${{ github.event_name == 'pull_request' && 'e2e-smoke' || (github.event.inputs.label_filter && format('e2e-{0}', github.event.inputs.label_filter) || 'e2e-test-all') }}
         run: |
+          source hack/e2e/timeouts.env
           if [ -z "$E2E_LABEL_FILTER" ]; then
-            test_timeout=45m
+            test_timeout=$E2E_TIMEOUT_LONG
           else
             case "$E2E_LABEL_FILTER" in
-              smoke|operator|auth|features) test_timeout=10m ;;
-              bootc|package-mode) test_timeout=15m ;;
-              container-build)     test_timeout=45m ;;
-              *)                   test_timeout=45m ;;
+              smoke|operator|auth|features) test_timeout=$E2E_TIMEOUT_FAST ;;
+              bootc|package-mode)           test_timeout=$E2E_TIMEOUT_SHORT ;;
+              container-build)              test_timeout=$E2E_TIMEOUT_LONG ;;
+              *)                            test_timeout=$E2E_TIMEOUT_LONG ;;
             esac
           fi
           ginkgo_args=(-v -ginkgo.v -timeout "$test_timeout")

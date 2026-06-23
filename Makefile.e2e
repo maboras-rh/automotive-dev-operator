@@ -14,10 +14,8 @@
 #                    Defaults to a specific suite namespace if not provided.
 ################################################################################
 
-# Ginkgo timeouts — keep in sync with .github/workflows/e2e.yml and e2e-lanes.yml
-E2E_TIMEOUT_FAST  ?= 10m   # smoke, operator, auth, features
-E2E_TIMEOUT_SHORT ?= 15m  # bootc, package-mode
-E2E_TIMEOUT_LONG  ?= 45m  # full suite
+# Ginkgo timeouts — sourced from hack/e2e/timeouts.env (single source of truth)
+include hack/e2e/timeouts.env
 
 # E2E test targets. Use test-e2e to run everything, or pick a lane:
 #   test-e2e-smoke        - quick smoke tests (CRDs, OperatorConfig, Build API, CR lifecycle)
