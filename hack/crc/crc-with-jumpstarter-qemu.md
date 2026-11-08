@@ -138,7 +138,7 @@ caib version
 Or from the local tree, without installing over a release binary:
 
 ```bash
-cd /Users/maboras/rh_workspace/aib/automotive-dev-operator_main
+cd <automotive-dev-operator workspace>
 make build-caib
 export PATH="$PWD/bin:$PATH"
 caib version
@@ -149,7 +149,7 @@ caib version
 Work from the operator repo. Do not point these scripts at the Jumpstarter repo.
 
 ```bash
-cd /Users/maboras/rh_workspace/aib/automotive-dev-operator_main
+cd <automotive-dev-operator workspace>
 ```
 
 ### Linux
